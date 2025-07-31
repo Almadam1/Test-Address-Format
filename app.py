@@ -66,17 +66,15 @@ def clean_address(address):
 # === LLM CORRECTION ===
 def correct_with_llm(prompt_address):
     system_prompt = """
-    Format the following mailing address according to strict database entry standards:
-    - Abbreviate directions (North -> N, Southwest -> SW, etc.)
-    - Use postal regulation street abbreviations (e.g., Ave, Blvd, St, etc.)
-    - Write out cities and towns in full (e.g., New York City instead of NYC)
-    - Use postal state abbreviations (e.g., NY, NJ, CA)
-    - Include ZIP+4 when possible (e.g., 10458-1234)
-    - Format PO boxes as 'PO Box 12345' or 'PO Box G'
-    - Abbreviate apartment, suite, or room numbers as Apt, Ste, or Rm and place them on the second line
-    - Remove special characters (e.g., # . ,)
-    - Write out school and business names in full (e.g., Montclair State University instead of MSU)
-    Return only the corrected mailing address as a single string.
+    You are a data formatting assistant. Format the following U.S. address line strictly according to institutional standards:
+    - Abbreviate directions (North → N, Southwest → SW, etc.)
+    - Use USPS-style street abbreviations (e.g., St, Ave, Blvd, etc.)
+    - Format PO Boxes as "PO Box ###"
+    - Normalize unit designators (Apt, Ste, Rm)
+    - Remove special characters (e.g., #, ., ,)
+    - Capitalize appropriately
+    - Ensure no trailing or multiple spaces exist
+    Return the corrected address as a single line only.
     """
 
     try:
@@ -88,7 +86,7 @@ def correct_with_llm(prompt_address):
             ],
             temperature=0.3,
         )
-        return response.choices[0].message.content.strip()
+        return re.sub(r'\s+', ' ', response.choices[0].message.content.strip())
     except RateLimitError:
         time.sleep(5)
         return correct_with_llm(prompt_address)
@@ -97,7 +95,7 @@ def correct_with_llm(prompt_address):
 
 # === STREAMLIT UI ===
 st.title("📬 Address Cleaner & Formatter")
-st.write("Upload a dataset with `AddrLine1` and `AddrLine2`. The app will return corrected addresses.")
+st.write("Upload a dataset with `AddrLine1` and `AddrLine2`. The app will return corrected address lines.")
 
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
@@ -109,7 +107,7 @@ if uploaded_file:
 
     # Combine lines
     df['RawAddress'] = df.apply(
-        lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip() 
+        lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip()
         if pd.notnull(row['AddrLine2']) else row['AddrLine1'], axis=1
     )
 
@@ -117,7 +115,7 @@ if uploaded_file:
     df['Cleaned'] = df['RawAddress'].apply(clean_address)
 
     # Step 2: LLM cleanup with real-time updates
-    st.subheader("📄 Original vs. Corrected Addresses (Live)")
+    st.subheader("📄 Original vs. Corrected Address Line (Live)")
     output_placeholder = st.empty()
     results = []
 
@@ -128,7 +126,7 @@ if uploaded_file:
         output_placeholder.dataframe(temp_df, use_container_width=True)
 
     final_df = pd.DataFrame(results)
-    st.success("✅ Address correction complete!")
+    st.success("✅ Address line correction complete!")
 
     # Download
     st.download_button(
