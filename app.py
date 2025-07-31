@@ -4,6 +4,8 @@ from rapidfuzz import fuzz, process
 import openai
 import re
 import os
+import time
+from openai import RateLimitError
 
 # === CONFIGURATION ===
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -77,15 +79,21 @@ def correct_with_llm(prompt_address):
     Return only the corrected mailing address as a single string.
     """
 
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt_address}
-        ],
-        temperature=0.3,
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt_address}
+            ],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content.strip()
+    except RateLimitError:
+        time.sleep(5)
+        return correct_with_llm(prompt_address)
+    except Exception as e:
+        return f"[LLM ERROR] {str(e)}"
 
 # === STREAMLIT UI ===
 st.title("📬 Address Cleaner & Formatter")
@@ -96,6 +104,9 @@ uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
 
+    # Limit to first 100 rows
+    df = df.head(100)
+
     # Combine lines
     df['RawAddress'] = df.apply(
         lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip() 
@@ -105,20 +116,24 @@ if uploaded_file:
     # Step 1: Rule-based cleaning
     df['Cleaned'] = df['RawAddress'].apply(clean_address)
 
-    # Step 2: LLM cleanup for all addresses
-    with st.spinner("Processing addresses with LLM..."):
-        df['CorrectedAddress'] = df['RawAddress'].apply(correct_with_llm)
+    # Step 2: LLM cleanup with real-time updates
+    st.subheader("📄 Original vs. Corrected Addresses (Live)")
+    output_placeholder = st.empty()
+    results = []
 
+    for i, raw in enumerate(df['RawAddress']):
+        corrected = correct_with_llm(raw)
+        results.append({"RawAddress": raw, "CorrectedAddress": corrected})
+        temp_df = pd.DataFrame(results)
+        output_placeholder.dataframe(temp_df, use_container_width=True)
+
+    final_df = pd.DataFrame(results)
     st.success("✅ Address correction complete!")
-
-    # Show table side by side
-    st.subheader("📄 Original vs. Corrected Addresses")
-    st.dataframe(df[['RawAddress', 'CorrectedAddress']])
 
     # Download
     st.download_button(
         label="📥 Download Corrected Addresses",
-        data=df.to_excel(index=False, engine='openpyxl'),
+        data=final_df.to_excel(index=False, engine='openpyxl'),
         file_name="corrected_addresses.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
