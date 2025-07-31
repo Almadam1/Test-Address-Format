@@ -77,7 +77,10 @@ def correct_with_llm(prompt_address):
     - Write out school and business names in full (e.g., Montclair State University instead of MSU)
     Return only the corrected mailing address as a single string.
     """
-    response = openai.ChatCompletion.create(
+
+    client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+    response = client.chat.completions.create(
         model="gpt-4",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -85,6 +88,7 @@ def correct_with_llm(prompt_address):
         ],
         temperature=0.3,
     )
+
     return response.choices[0].message.content.strip()
 
 # === STREAMLIT UI ===
