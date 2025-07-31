@@ -5,10 +5,17 @@ import openai
 import re
 import os
 import time
+import io
 from openai import RateLimitError
 
 # === CONFIGURATION ===
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+# Known compound street names to preserve
+compound_names = [
+    "northwood", "southgate", "eastwood", "westfield",
+    "northridge", "southridge", "eastview", "westpark"
+]
 
 # === RULE-BASED CLEANUP ===
 def clean_address(address):
@@ -16,6 +23,10 @@ def clean_address(address):
         return ""
 
     address = address.lower()
+
+    # Preserve compound names before abbreviation
+    for name in compound_names:
+        address = re.sub(rf'\b{name}\b', name.replace(" ", ""), address)
 
     # Remove special characters
     address = re.sub(r'[.,#]', '', address)
@@ -28,7 +39,7 @@ def clean_address(address):
     for word, abbr in directionals.items():
         address = re.sub(rf'\b{word}\b', abbr, address)
 
-    # Street types - expanded list based on Word doc (sample subset)
+    # Street types
     street_types = {
         'avenue': 'ave', 'av': 'ave', 'aven': 'ave', 'avenu': 'ave', 'avnue': 'ave',
         'boulevard': 'blvd', 'blvd': 'blvd', 'boul': 'blvd', 'boulv': 'blvd',
@@ -52,15 +63,12 @@ def clean_address(address):
     address = re.sub(r'\b(apartment|apt)\b', 'apt', address)
     address = re.sub(r'\b(ste|suite)\b', 'ste', address)
     address = re.sub(r'\b(room|rm)\b', 'rm', address)
-    address = re.sub(r'\b(floor|fl)\b', 'apt', address)  # floor normalized to apt
+    address = re.sub(r'\b(floor|fl)\b', 'apt', address)
 
     # PO Box normalization
     address = re.sub(r'\b(pobox|pob|po box|po#|box)\s*(\w+)', r'PO Box \2', address)
 
-    # Remove extra spaces
     address = re.sub(r'\s+', ' ', address).strip()
-
-    # Title case
     return address.title()
 
 # === LLM CORRECTION ===
@@ -74,6 +82,7 @@ def correct_with_llm(prompt_address):
     - Remove special characters (e.g., #, ., ,)
     - Capitalize appropriately
     - Ensure no trailing or multiple spaces exist
+    - Do NOT separate compound names like Northwood, Southridge, etc.
     Return the corrected address as a single line only.
     """
 
@@ -86,7 +95,8 @@ def correct_with_llm(prompt_address):
             ],
             temperature=0.3,
         )
-        return re.sub(r'\s+', ' ', response.choices[0].message.content.strip())
+        result = response.choices[0].message.content.strip()
+        return re.sub(r'\s+', ' ', result)
     except RateLimitError:
         time.sleep(5)
         return correct_with_llm(prompt_address)
@@ -101,20 +111,14 @@ uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
-
-    # Limit to first 100 rows
     df = df.head(100)
-
-    # Combine lines
     df['RawAddress'] = df.apply(
         lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip()
         if pd.notnull(row['AddrLine2']) else row['AddrLine1'], axis=1
     )
 
-    # Step 1: Rule-based cleaning
     df['Cleaned'] = df['RawAddress'].apply(clean_address)
 
-    # Step 2: LLM cleanup with real-time updates
     st.subheader("📄 Original vs. Corrected Address Line (Live)")
     output_placeholder = st.empty()
     results = []
@@ -128,10 +132,13 @@ if uploaded_file:
     final_df = pd.DataFrame(results)
     st.success("✅ Address line correction complete!")
 
-    # Download
+    excel_buffer = io.BytesIO()
+    final_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+    excel_buffer.seek(0)
+
     st.download_button(
         label="📥 Download Corrected Addresses",
-        data=final_df.to_excel(index=False, engine='openpyxl'),
+        data=excel_buffer,
         file_name="corrected_addresses.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
