@@ -6,7 +6,7 @@ import re
 import os
 
 # === CONFIGURATION ===
-openai.api_key = st.secrets["OPENAI_API_KEY"]  # Set this in Streamlit secrets
+client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # === RULE-BASED CLEANUP ===
 def clean_address(address):
@@ -42,7 +42,6 @@ def clean_address(address):
         'junction': 'jct', 'jctn': 'jct', 'junctn': 'jct', 'junctions': 'jcts',
         'mount': 'mt', 'mountain': 'mtn', 'mountin': 'mtn',
         'heights': 'hts', 'highway': 'hwy', 'expressway': 'expy'
-        # Extend as needed
     }
     for word, abbr in street_types.items():
         address = re.sub(rf'\b{word}\b', abbr, address)
@@ -78,8 +77,6 @@ def correct_with_llm(prompt_address):
     Return only the corrected mailing address as a single string.
     """
 
-    client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
     response = client.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -88,7 +85,6 @@ def correct_with_llm(prompt_address):
         ],
         temperature=0.3,
     )
-
     return response.choices[0].message.content.strip()
 
 # === STREAMLIT UI ===
@@ -114,6 +110,9 @@ if uploaded_file:
         df['CorrectedAddress'] = df['RawAddress'].apply(correct_with_llm)
 
     st.success("✅ Address correction complete!")
+
+    # Show table side by side
+    st.subheader("📄 Original vs. Corrected Addresses")
     st.dataframe(df[['RawAddress', 'CorrectedAddress']])
 
     # Download
