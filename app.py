@@ -4,18 +4,9 @@ from rapidfuzz import fuzz, process
 import openai
 import re
 import os
-import time
-import io
-from openai import RateLimitError
 
 # === CONFIGURATION ===
-client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
-# Known compound street names to preserve
-compound_names = [
-    "northwood", "southgate", "eastwood", "westfield",
-    "northridge", "southridge", "eastview", "westpark"
-]
+openai.api_key = st.secrets["OPENAI_API_KEY"]  # Set this in Streamlit secrets
 
 # === RULE-BASED CLEANUP ===
 def clean_address(address):
@@ -23,10 +14,6 @@ def clean_address(address):
         return ""
 
     address = address.lower()
-
-    # Preserve compound names before abbreviation
-    for name in compound_names:
-        address = re.sub(rf'\b{name}\b', name.replace(" ", ""), address)
 
     # Remove special characters
     address = re.sub(r'[.,#]', '', address)
@@ -39,7 +26,7 @@ def clean_address(address):
     for word, abbr in directionals.items():
         address = re.sub(rf'\b{word}\b', abbr, address)
 
-    # Street types
+    # Street types - expanded list based on Word doc (sample subset)
     street_types = {
         'avenue': 'ave', 'av': 'ave', 'aven': 'ave', 'avenu': 'ave', 'avnue': 'ave',
         'boulevard': 'blvd', 'blvd': 'blvd', 'boul': 'blvd', 'boulv': 'blvd',
@@ -55,6 +42,7 @@ def clean_address(address):
         'junction': 'jct', 'jctn': 'jct', 'junctn': 'jct', 'junctions': 'jcts',
         'mount': 'mt', 'mountain': 'mtn', 'mountin': 'mtn',
         'heights': 'hts', 'highway': 'hwy', 'expressway': 'expy'
+        # Extend as needed
     }
     for word, abbr in street_types.items():
         address = re.sub(rf'\b{word}\b', abbr, address)
@@ -63,82 +51,71 @@ def clean_address(address):
     address = re.sub(r'\b(apartment|apt)\b', 'apt', address)
     address = re.sub(r'\b(ste|suite)\b', 'ste', address)
     address = re.sub(r'\b(room|rm)\b', 'rm', address)
-    address = re.sub(r'\b(floor|fl)\b', 'apt', address)
+    address = re.sub(r'\b(floor|fl)\b', 'apt', address)  # floor normalized to apt
 
     # PO Box normalization
     address = re.sub(r'\b(pobox|pob|po box|po#|box)\s*(\w+)', r'PO Box \2', address)
 
+    # Remove extra spaces
     address = re.sub(r'\s+', ' ', address).strip()
+
+    # Title case
     return address.title()
 
 # === LLM CORRECTION ===
 def correct_with_llm(prompt_address):
     system_prompt = """
-    You are a data formatting assistant. Format the following U.S. address line strictly according to institutional standards:
-    - Abbreviate directions (North → N, Southwest → SW, etc.)
-    - Use USPS-style street abbreviations (e.g., St, Ave, Blvd, etc.)
-    - Format PO Boxes as "PO Box ###"
-    - Normalize unit designators (Apt, Ste, Rm)
-    - Remove special characters (e.g., #, ., ,)
-    - Capitalize appropriately
-    - Ensure no trailing or multiple spaces exist
-    - Do NOT separate compound names like Northwood, Southridge, etc.
-    Return the corrected address as a single line only.
+    Format the following mailing address according to strict database entry standards:
+    - Abbreviate directions (North -> N, Southwest -> SW, etc.)
+    - Use postal regulation street abbreviations (e.g., Ave, Blvd, St, etc.)
+    - Write out cities and towns in full (e.g., New York City instead of NYC)
+    - Use postal state abbreviations (e.g., NY, NJ, CA)
+    - Include ZIP+4 when possible (e.g., 10458-1234)
+    - Format PO boxes as 'PO Box 12345' or 'PO Box G'
+    - Abbreviate apartment, suite, or room numbers as Apt, Ste, or Rm and place them on the second line
+    - Remove special characters (e.g., # . ,)
+    - Write out school and business names in full (e.g., Montclair State University instead of MSU)
+    Return only the corrected mailing address as a single string.
     """
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt_address}
-            ],
-            temperature=0.3,
-        )
-        result = response.choices[0].message.content.strip()
-        return re.sub(r'\s+', ' ', result)
-    except RateLimitError:
-        time.sleep(5)
-        return correct_with_llm(prompt_address)
-    except Exception as e:
-        return f"[LLM ERROR] {str(e)}"
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_address}
+        ],
+        temperature=0.3,
+    )
+    return response.choices[0].message.content.strip()
 
 # === STREAMLIT UI ===
 st.title("📬 Address Cleaner & Formatter")
-st.write("Upload a dataset with `AddrLine1` and `AddrLine2`. The app will return corrected address lines.")
+st.write("Upload a dataset with `AddrLine1` and `AddrLine2`. The app will return corrected addresses.")
 
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
-    df = df.head(100)
+
+    # Combine lines
     df['RawAddress'] = df.apply(
-        lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip()
+        lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip() 
         if pd.notnull(row['AddrLine2']) else row['AddrLine1'], axis=1
     )
 
+    # Step 1: Rule-based cleaning
     df['Cleaned'] = df['RawAddress'].apply(clean_address)
 
-    st.subheader("📄 Original vs. Corrected Address Line (Live)")
-    output_placeholder = st.empty()
-    results = []
+    # Step 2: LLM cleanup for all addresses
+    with st.spinner("Processing addresses with LLM..."):
+        df['CorrectedAddress'] = df['RawAddress'].apply(correct_with_llm)
 
-    for i, raw in enumerate(df['RawAddress']):
-        corrected = correct_with_llm(raw)
-        results.append({"RawAddress": raw, "CorrectedAddress": corrected})
-        temp_df = pd.DataFrame(results)
-        output_placeholder.dataframe(temp_df, use_container_width=True)
+    st.success("✅ Address correction complete!")
+    st.dataframe(df[['RawAddress', 'CorrectedAddress']])
 
-    final_df = pd.DataFrame(results)
-    st.success("✅ Address line correction complete!")
-
-    excel_buffer = io.BytesIO()
-    final_df.to_excel(excel_buffer, index=False, engine='openpyxl')
-    excel_buffer.seek(0)
-
+    # Download
     st.download_button(
         label="📥 Download Corrected Addresses",
-        data=excel_buffer,
+        data=df.to_excel(index=False, engine='openpyxl'),
         file_name="corrected_addresses.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
