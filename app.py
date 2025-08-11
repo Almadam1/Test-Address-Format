@@ -111,6 +111,7 @@ uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
+    df = df.head(100)
     df['RawAddress'] = df.apply(
         lambda row: f"{row['AddrLine1']} {row['AddrLine2']}".strip()
         if pd.notnull(row['AddrLine2']) else row['AddrLine1'], axis=1
