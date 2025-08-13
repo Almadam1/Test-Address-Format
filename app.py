@@ -58,24 +58,28 @@ def restore_compounds(s: str, compounds: list[str]) -> str:
     return out
 
 # =========================
-# Rule-based cleaner
+# Rule-based cleaner (updated)
 # =========================
 def rule_clean(address: str) -> str:
     if address is None or str(address).strip() == "":
         return ""
     s = str(address).lower().strip()
 
-    # --- Units & hash handling FIRST so we don't lose the signal by stripping '#'
-    # Convert "#5C" (or " # 5C") to "apt 5c"
+    # Normalize common punctuation spacing early
+    s = re.sub(r"\s*[.,]\s*", " ", s)
+
+    # Convert "#5C" (or " # 5C") to "apt 5c" BEFORE stripping '#'
     s = re.sub(r'(?:^|\s)#\s*([a-z0-9-]+)\b', r' apt \1', s, flags=re.IGNORECASE)
-    # Normalize explicit unit synonyms
+
+    # Normalize unit synonyms — keep 'unit' as 'unit', keep bsmt
     s = re.sub(r'\b(apartment|apt)\b\.?', 'apt', s, flags=re.IGNORECASE)
     s = re.sub(r'\b(suite|ste)\b\.?', 'ste', s, flags=re.IGNORECASE)
     s = re.sub(r'\b(room|rm)\b', 'rm', s, flags=re.IGNORECASE)
-    s = re.sub(r'\b(unit|floor|fl)\b', 'apt', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b(unit)\b\.?', 'unit', s, flags=re.IGNORECASE)  # preserve 'unit'
+    s = re.sub(r'\bbasement\b', 'bsmt', s, flags=re.IGNORECASE)
 
     # Remove stray punctuation
-    s = re.sub(r"[.,#]", "", s)
+    s = re.sub(r"[#,]", "", s)
 
     # Directionals
     directionals = {
@@ -102,23 +106,41 @@ def rule_clean(address: str) -> str:
     for word, abbr in street_types.items():
         s = re.sub(rf"\b{word}\b", abbr, s)
 
-    # Infer unlabeled trailing unit (e.g., "... Ave 5C" -> "... Ave Apt 5C")
-    if not re.search(r'\b(apt|ste|rm)\b', s, flags=re.IGNORECASE):
-        s = re.sub(
-            r'\b(ave|st|blvd|dr|rd|ln|ter|pl|ct|cir|pkwy|hwy|way|loop|trl|expy)\b\s+([a-z0-9-]{1,6})$',
-            r'\1 apt \2',
-            s,
-            flags=re.IGNORECASE
-        )
+    # Move leading unit to end (e.g., 'apt a 19204 39th ave' -> '19204 39th ave apt a')
+    m = re.match(r'^(?:\s*(apt|ste|rm|unit)\s+([a-z0-9-]+)\s+)(.+)$', s)
+    if m:
+        unit_lbl, unit_val, rest = m.groups()
+        s = f"{rest.strip()} {unit_lbl} {unit_val}"
+
+    # Infer unlabeled trailing unit like '... Ave 5C' -> '... Ave Apt 5C' if no unit label present
+    if not re.search(r'\b(apt|ste|rm|unit|bsmt)\b', s, flags=re.IGNORECASE):
+        if re.search(r'\b(ave|st|blvd|dr|rd|ln|ter|pl|ct|cir|pkwy|hwy|way|loop|trl|expy)\b\s+([a-z0-9-]{1,6})$', s, flags=re.IGNORECASE):
+            if not re.search(r'\bbsmt\b$', s):
+                s = re.sub(
+                    r'(\b(?:ave|st|blvd|dr|rd|ln|ter|pl|ct|cir|pkwy|hwy|way|loop|trl|expy)\b)\s+([a-z0-9-]{1,6})$',
+                    r'\1 apt \2',
+                    s
+                )
 
     # PO Box normalization
-    s = re.sub(r'\b(pobox|pob|po box|po#|box)\s*(\w+)', r'PO Box \2', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b(pobox|pob|po box|po#|box)\s*(\w+)\b', r'PO Box \2', s, flags=re.IGNORECASE)
 
+    # De-duplicate whole-line repeats (rare but observed)
+    parts = s.split()
+    half = len(parts) // 2
+    if len(parts) % 2 == 0 and parts[:half] == parts[half:]:
+        s = " ".join(parts[:half])
+
+    # Spacing & title case; ensure Unit and Bsmt capitalization
     s = re.sub(r"\s+", " ", s).strip()
-    return s.title()
+    s = s.title()
+    s = re.sub(r'\bUnit\b', 'Unit', s)
+    s = re.sub(r'\bBsmt\b', 'Bsmt', s)
+
+    return s
 
 # =========================
-# LLM correction (address line only)
+# LLM correction (address line only) with stronger instruction & few-shot hints
 # =========================
 def llm_correct(address_line: str, compounds: list[str]) -> str:
     pre = protect_compounds(address_line, compounds)
@@ -126,12 +148,24 @@ def llm_correct(address_line: str, compounds: list[str]) -> str:
     sys_prompt = (
         "You are a data formatting assistant. "
         "Format the following U.S. address LINE ONLY (no city/state/ZIP). "
-        "Rules: abbreviate directions (North→N, Southwest→SW); use USPS street abbreviations (St, Ave, Blvd, Rd, Dr, Ln, Ter, Pl, Ct, Cir, Pkwy, Hwy, etc.); "
-        "format PO Boxes as 'PO Box ###'; normalize unit designators (Apt, Ste, Rm); "
-        "if the line ends with an unlabeled unit like '5C' (or was '#5C'), convert to 'Apt 5C'; "
-        "remove special characters; title case; single spaces only; "
-        "DO NOT include city/state/ZIP; DO NOT split compound street names like Northwood/Eastwood/Mount Carmel. "
-        "Return one single line only."
+        "Rules:\n"
+        "• Abbreviate directions: North→N, South→S, East→E, West→W, NE/NW/SE/SW.\n"
+        "• Use USPS street types: St, Ave, Blvd, Rd, Dr, Ln, Ter, Pl, Ct, Cir, Pkwy, Hwy, etc.\n"
+        "• PO Boxes as: 'PO Box ###'.\n"
+        "• Units: use Apt / Ste / Rm when those labels appear or must be inferred; if the input explicitly uses 'Unit', KEEP 'Unit'.\n"
+        "• If the line ends with an unlabeled unit like '5C' (or was '#5C'), convert to 'Apt 5C'.\n"
+        "• Keep 'Bsmt' as is (do not convert to Apt or Ste).\n"
+        "• If a unit label appears before the street (e.g., 'Apt A 19204 39th Ave'), move it to the end ('19204 39th Ave Apt A').\n"
+        "• Remove special characters (# . ,), deduplicate accidental repeats, title case, and ensure single spaces only.\n"
+        "• Do NOT include city/state/ZIP; return ONE line only.\n\n"
+        "Examples:\n"
+        "Input: '1515 Summer St Unit 503' → Output: '1515 Summer St Unit 503'\n"
+        "Input: '111 Centre Avenue unit 416' → Output: '111 Centre Ave Unit 416'\n"
+        "Input: '337 Packman Avenue Bsmt' → Output: '337 Packman Ave Bsmt'\n"
+        "Input: 'Apt. A 19204 39th Ave' → Output: '19204 39th Ave Apt A'\n"
+        "Input: '2187 Cruger Ave #5C' → Output: '2187 Cruger Ave Apt 5C'\n"
+        "Input: '2720 Grand Concourse 201' → Output: '2720 Grand Concourse Apt 201'\n"
+        "Input: '3154 Randall Avenue 3154 Randall Avenue' → Output: '3154 Randall Ave'\n"
     )
 
     try:
@@ -365,7 +399,7 @@ else:
         raw_line2_col = st.selectbox("Raw: Address Line 2 column (optional)", options=["<none>"] + raw_cols, index=0, key="rp_l2")
         id_col = st.selectbox("Optional: ID column (e.g., CWID)", options=["<none>"] + raw_cols, index=0, key="rp_id")
 
-        raw_df = raw_df.head(int(max_rows)).copy()
+        raw_df = raw_df.head(int(DEFAULT_MAX_ROWS if max_rows is None else max_rows)).copy()
 
         # Build RawAddress
         if raw_line2_col != "<none>" and raw_line2_col in raw_df.columns:
@@ -378,7 +412,9 @@ else:
 
         # Normalize ID for clean output
         if id_col != "<none>":
-            raw_df["ID"] = normalize_id_series(raw_df[id_col])
+            raw_df["ID"] = (
+                raw_df[id_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            )
 
         st.subheader("Processing")
         placeholder = st.empty()
@@ -391,7 +427,7 @@ else:
             results.append(pred)
             placeholder.progress(min(i / max(1, total), 1.0))
 
-        # Build output CSV (ID + CorrectedAddress, plus Raw if helpful)
+        # Build output CSV (ID + CorrectedAddress, plus Raw for audit)
         out_df = pd.DataFrame({"CorrectedAddress": results})
         if id_col != "<none>":
             out_df = pd.concat([raw_df[["ID"]].reset_index(drop=True), out_df], axis=1)
