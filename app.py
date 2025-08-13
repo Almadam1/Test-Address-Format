@@ -21,7 +21,8 @@ SUGGESTIONS_EXPORT = "mismatch_suggestions.csv"
 
 # USPS state codes (for stripping city/state/ZIP tails)
 USPS_STATES = {
-    'AL','AK','AZ','AR','CA','CO','CT','DC','DE','FL','GA','HI','IA','ID','IL','IN','KS','KY','LA','MA','MD','ME','MI','MN','MO','MS','MT','NC','ND','NE','NH','NJ','NM','NV','NY','OH','OK','OR','PA','PR','RI','SC','SD','TN','TX','UT','VA','VI','VT','WA','WI','WV','WY'
+    'AL','AK','AZ','AR','CA','CO','CT','DC','DE','FL','GA','HI','IA','ID','IL','IN','KS','KY','LA','MA','MD','ME','MI','MN','MO','MS','MT',
+    'NC','ND','NE','NH','NJ','NM','NV','NY','OH','OK','OR','PA','PR','RI','SC','SD','TN','TX','UT','VA','VI','VT','WA','WI','WV','WY'
 }
 
 # USPS-style street types (expanded)
@@ -87,7 +88,7 @@ USPS_STREET_TYPES = {
     "square": "sq", "squares": "sqs",
     "station": "sta", "stravenue": "stra", "stream": "strm",
     "street": "st", "streets": "sts",
-    "summit": "smt", "terrace": "ter",  # NOTE: your reference data may prefer 'terr'; handle in learning
+    "summit": "smt", "terrace": "ter",  # NOTE: your reference may prefer 'terr' — learn via rules
     "throughway": "trwy", "trace": "trce", "track": "trak",
     "trafficway": "trfy", "trail": "trl", "trailer": "trlr",
     "tunnel": "tunl", "turnpike": "tpke",
@@ -129,7 +130,6 @@ DEFAULT_COMPOUNDS = [
 # =========================
 # Helpers: compound handling
 # =========================
-
 def protect_compounds(s: str, compounds: List[str]) -> str:
     s_low = str(s)
     for name in compounds:
@@ -142,12 +142,10 @@ def protect_compounds(s: str, compounds: List[str]) -> str:
             s_low = re.sub(pat, token, s_low, flags=re.IGNORECASE)
     return s_low
 
-
 def restore_compounds(s: str, compounds: List[str]) -> str:
     out = str(s)
     for name in compounds:
         token = name.replace(" ", "")
-        # Restore with the original spacing/case titleized
         canonical = name.title()
         out = re.sub(rf"\b{re.escape(token)}\b", canonical, out, flags=re.IGNORECASE)
     out = re.sub(r"\s+", " ", out).strip()
@@ -156,12 +154,11 @@ def restore_compounds(s: str, compounds: List[str]) -> str:
 # =========================
 # Adaptive Learning Store
 # =========================
-
 def get_store() -> Dict:
     if "learning_pairs" not in st.session_state:
         st.session_state.learning_pairs = []  # list of {raw, predicted, correct}
     if "custom_rules" not in st.session_state:
-        # each rule: {"pattern": str, "replacement": str, "where": "pre"|"post"}
+        # each rule: {"pattern": str, "replacement": str, "where": "pre"|"post"|"both"}
         st.session_state.custom_rules = []
     if "fewshot_examples" not in st.session_state:
         # list of (input_line, output_line)
@@ -172,11 +169,10 @@ def get_store() -> Dict:
         "fewshot_examples": st.session_state.fewshot_examples,
     }
 
-
 def load_learning_store(uploaded_file):
-    store = get_store()
+    _ = get_store()
     if uploaded_file is None:
-        return store
+        return get_store()
     # Accept either JSONL or JSON
     content = uploaded_file.read().decode("utf-8")
     if uploaded_file.name.endswith(".jsonl"):
@@ -198,7 +194,6 @@ def load_learning_store(uploaded_file):
             pass
     return get_store()
 
-
 def _ingest_store_obj(obj: Dict):
     store = get_store()
     for k in ["learning_pairs", "custom_rules", "fewshot_examples"]:
@@ -207,7 +202,6 @@ def _ingest_store_obj(obj: Dict):
             for item in obj[k]:
                 if item not in existing:
                     existing.append(item)
-
 
 def export_learning_store() -> str:
     store = get_store()
@@ -218,10 +212,8 @@ def export_learning_store() -> str:
 # =========================
 # Light similarity for few-shot selection
 # =========================
-
 def _token_set(s: str) -> set:
     return set(re.findall(r"[a-z0-9]+", s.lower()))
-
 
 def most_similar_examples(inp: str, k: int = 6) -> List[Tuple[str, str]]:
     exs = get_store()["fewshot_examples"]
@@ -240,7 +232,6 @@ def most_similar_examples(inp: str, k: int = 6) -> List[Tuple[str, str]]:
 # =========================
 # Adaptive rules application
 # =========================
-
 def apply_custom_rules(s: str, where: str = "pre") -> str:
     for rule in get_store()["custom_rules"]:
         if rule.get("where", "pre") in (where, "both"):
@@ -253,9 +244,9 @@ def apply_custom_rules(s: str, where: str = "pre") -> str:
 # =========================
 # Utilities
 # =========================
-
 def strip_city_state_zip(s: str) -> str:
-    """Remove trailing ZIP (5/9), and trailing state codes like 'NY' possibly repeated.
+    """
+    Remove trailing ZIP (5/9), and trailing state codes like 'NY' possibly repeated.
     Examples handled: '... 10462 NY NY' → drop trailing parts; '... NY 10462' → drop; '... 10462-1234' → drop.
     """
     tokens = re.findall(r"[A-Za-z0-9-]+", s)
@@ -266,19 +257,17 @@ def strip_city_state_zip(s: str) -> str:
     if i and re.fullmatch(r"\d{5}(-\d{4})?", tokens[i-1] or ""):
         i -= 1
     # Drop up to two trailing state codes
-    removed_any = True
     count = 0
     while i and count < 2 and (tokens[i-1] or "").upper() in USPS_STATES:
         i -= 1
         count += 1
-    # Rebuild from remaining tokens plus original spacing approximated
     return " ".join(tokens[:i]) if i else ""
 
-
 def abbrev_terminal_suffix(s: str) -> str:
-    """Only abbreviate the terminal street-type token (before unit/PO Box),
-    to avoid changing parts of the proper street name (e.g., 'Centre Avenue' should keep 'Centre')."""
-    # Split on spaces to inspect tail
+    """
+    Only abbreviate the terminal street-type token (before unit/PO Box),
+    to avoid changing parts of the proper street name (e.g., 'Centre Avenue' should keep 'Centre').
+    """
     parts = s.split()
     if not parts:
         return s
@@ -288,7 +277,6 @@ def abbrev_terminal_suffix(s: str) -> str:
     # If a PO Box appears, leave suffixes alone
     try:
         po_index = [p.lower() for p in parts].index("po")
-        # if 'PO Box' present, don't try to find a street suffix
         stop = min(stop, po_index)
     except ValueError:
         pass
@@ -304,28 +292,27 @@ def abbrev_terminal_suffix(s: str) -> str:
         return " ".join(parts)
     return s
 
-
 def normalize_unit_token(tok: str) -> str:
     # Uppercase alphanum units like 4c → 4C, 24d → 24D, 4fe → 4FE
     if re.fullmatch(r"[0-9]+[a-z0-9-]*", tok.lower()):
-        # keep digits and hyphens; uppercase letters
         return re.sub(r"[a-z]", lambda m: m.group(0).upper(), tok)
     return tok
 
 # =========================
 # Rule-based cleaner (updated, safer)
 # =========================
-
-def rule_clean(address: str, compounds: List[str], *,
-               unit_style: str = "preserve",
-               infer_unlabeled_unit: bool = False,
-               keep_hash_if_present: bool = True,
-               preserve_proper_directionals: bool = True) -> str:
+def rule_clean(
+    address: str,
+    compounds: List[str],
+    *,
+    unit_style: str = "preserve",
+    infer_unlabeled_unit: bool = False,
+    keep_hash_if_present: bool = True,           # kept for compatibility, not used directly
+    preserve_proper_directionals: bool = True    # behavior covered via compound protection
+) -> str:
     """
     unit_style: one of ['preserve','apt','hash','none']
     infer_unlabeled_unit: only infer when trailing token begins with a digit (avoid N/E/S/W)
-    keep_hash_if_present: if raw has '#', preserve it as '# <val>' unless unit_style overrides
-    preserve_proper_directionals: do not abbreviate 'West St', 'North Ave', etc.
     """
     if address is None or str(address).strip() == "":
         return ""
@@ -347,8 +334,15 @@ def rule_clean(address: str, compounds: List[str], *,
     # Protect compounds (and proper directional streets) from abbreviation
     s = protect_compounds(s, compounds)
 
-    # Normalize inline '#<unit>' → mark for later formatting if preserving hash
-    # Keep a flag if raw contained a hash
+    # Normalize PO Box early (before punctuation removal drops clues)
+    s = re.sub(
+        r"\b(?:p\.?\s*o\.?|po)\s*(?:box|bx|#)?\s*([A-Za-z0-9-]+)\b",
+        r"po box \1",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalize inline '#<unit>' → keep captured value
     had_hash = bool(re.search(r"(?:^|\s)#\s*[a-z0-9-]+\b", s, flags=re.IGNORECASE))
     s = re.sub(r'(?:^|\s)#\s*([a-z0-9-]+)\b', r' # \1', s, flags=re.IGNORECASE)
 
@@ -361,10 +355,10 @@ def rule_clean(address: str, compounds: List[str], *,
     s = re.sub(r'\bpenthouse\b', 'ph', s, flags=re.IGNORECASE)
     s = re.sub(r'\bph\b', 'ph', s, flags=re.IGNORECASE)  # keep PH/Ph as unit label
 
-    # Remove stray commas/periods; keep hash placeholder we added above
+    # Remove stray commas/periods (we've already normalized #, PO Box)
     s = re.sub(r"[,.]", "", s)
 
-    # Directionals (standalone only). If preserving proper directional streets, they are protected already.
+    # Directionals (standalone only)
     for word, abbr in DIRECTIONALS.items():
         s = re.sub(rf"\b{word}\b", abbr, s)
 
@@ -377,48 +371,53 @@ def rule_clean(address: str, compounds: List[str], *,
         unit_lbl, unit_val, rest = m.groups()
         s = f"{rest.strip()} {unit_lbl} {unit_val}"
 
-    # Optionally infer unlabeled trailing unit if token begins with a digit and is not a directional token
+    # Optionally infer unlabeled trailing unit if token begins with a digit
     if infer_unlabeled_unit and not re.search(r'\b(apt|ste|rm|unit|bsmt|ph|fl)\b', s, flags=re.IGNORECASE):
         m2 = re.search(r"\b([0-9][a-z0-9-]{0,7})$", s, flags=re.IGNORECASE)
         if m2:
-            unit_tok = m2.group(1)
-            # Avoid misreading directionals like 'N','S','E','W' which don't start with digit; safe here
-            s = re.sub(r"\b([0-9][a-z0-9-]{0,7})$", r"apt " if unit_style in ("apt","preserve") else (r"# " if unit_style=="hash" else r""), s)
+            if unit_style in ("apt", "preserve"):
+                s = re.sub(r"\b([0-9][a-z0-9-]{0,7})$", r"apt \1", s)
+            elif unit_style == "hash":
+                s = re.sub(r"\b([0-9][a-z0-9-]{0,7})$", r"# \1", s)
+            else:
+                # 'none' → keep as unlabeled token
+                pass
 
-    # If we chose not to infer, but there is a trailing unit token, normalize its case (e.g., '4fe' → '4FE')
-    # Also keep 'ph' as title case 'Ph'
+    # Normalize trailing unit token case if present and unlabeled
     parts = s.split()
     if parts:
         last = parts[-1]
         if last not in {"apt","ste","rm","unit","ph","fl","bsmt","#"}:
-            normalized_last = normalize_unit_token(last)
-            # Don't uppercase 'ph' or 'fl' when they are labels
-            parts[-1] = normalized_last
+            parts[-1] = normalize_unit_token(last)
             s = " ".join(parts)
 
     # Unit label style conversion (post-process)
-    if unit_style in ("apt","hash","none"):
-        # Replace any existing style to requested
-        # Patterns: 'apt X', 'ste X', 'rm X', '# X'
+    if unit_style in ("apt", "hash", "none"):
         if unit_style == "apt":
-            s = re.sub(r"\b(ste|rm|unit)\s+([a-z0-9-]+)\b", r"apt ", s)
-            s = re.sub(r"\s#\s*([a-z0-9-]+)\b", r" apt ", s)
+            s = re.sub(r"\b(ste|rm|unit)\s+([a-z0-9-]+)\b", r"apt \2", s)
+            s = re.sub(r"\s#\s*([a-z0-9-]+)\b", r" apt \1", s)
         elif unit_style == "hash":
-            s = re.sub(r"\b(apt|ste|rm|unit)\s+([a-z0-9-]+)\b", r"# ", s)
-            if not had_hash and " # " not in s:
-                # If there's already a trailing unlabeled unit token following a suffix, convert it to '#'
-                s = re.sub(r"\b(ave|st|blvd|dr|rd|ln|ter|pl|ct|cir|pkwy|hwy|way|loop|trl|expy)\b\s+([0-9][a-z0-9-]{0,7})$", r" # ", s, flags=re.IGNORECASE)
+            s = re.sub(r"\b(apt|ste|rm|unit)\s+([a-z0-9-]+)\b", r"# \2", s)
+            # Convert trailing unlabeled to "# <val>" after a street suffix
+            s = re.sub(
+                r"\b(ave|st|blvd|dr|rd|ln|ter|pl|ct|cir|pkwy|hwy|way|loop|trl|expy)\b\s+([0-9][a-z0-9-]{0,7})$",
+                r"\1 # \2",
+                s,
+                flags=re.IGNORECASE,
+            )
         elif unit_style == "none":
-            s = re.sub(r"\b(apt|ste|rm|unit)\s+([a-z0-9-]+)\b", r"", s)
-            s = re.sub(r"\s#\s*([a-z0-9-]+)\b", r" ", s)
+            s = re.sub(r"\b(apt|ste|rm|unit)\s+([a-z0-9-]+)\b", r"\2", s)
+            s = re.sub(r"\s#\s*([a-z0-9-]+)\b", r" \1", s)
 
     # Spacing & title case & restore compounds
     s = re.sub(r"\s+", " ", s).strip()
     s = s.title()
     s = restore_compounds(s, compounds)
-    # Ensure label capitalization for known units
+
+    # Ensure label capitalization for known units and "PO Box"
     for lbl in ["Apt","Ste","Rm","Unit","Bsmt","Ph","Fl"]:
         s = re.sub(rf"\b{lbl}\b", lbl, s)
+    s = re.sub(r"\bPo Box\b", "PO Box", s)
 
     # Apply user/learned POST rules
     s = apply_custom_rules(s, where="post")
@@ -428,11 +427,15 @@ def rule_clean(address: str, compounds: List[str], *,
 # =========================
 # LLM correction (address line) with adaptive few-shot
 # =========================
-
-def llm_correct(address_line: str, compounds: List[str], model_name: str, *,
-                unit_style: str,
-                infer_unlabeled_unit: bool,
-                preserve_proper_directionals: bool) -> str:
+def llm_correct(
+    address_line: str,
+    compounds: List[str],
+    model_name: str,
+    *,
+    unit_style: str,
+    infer_unlabeled_unit: bool,
+    preserve_proper_directionals: bool
+) -> str:
     pre = protect_compounds(address_line, compounds)
 
     # Build few-shot block from learned examples (most similar first)
@@ -442,10 +445,10 @@ def llm_correct(address_line: str, compounds: List[str], model_name: str, *,
         ex_lines.append(f"Input: '{ui}' → Output: '{vo}'")
     base_examples = [
         "Input: '1515 Summer St Unit 503' → Output: '1515 Summer St Unit 503'",
-        "Input: '111 Centre Avenue unit 416' → Output: '111 Centre Ave 416'",  # unit style may remove label
+        "Input: '111 Centre Avenue unit 416' → Output: '111 Centre Ave 416'",
         "Input: '337 Packman Avenue Bsmt' → Output: '337 Packman Ave Bsmt'",
         "Input: 'Apt. A 19204 39th Ave' → Output: '19204 39th Ave Apt A'",
-        "Input: '2187 Cruger Ave #5C' → Output: '2187 Cruger Ave # 5C'",  # hash style example
+        "Input: '2187 Cruger Ave #5C' → Output: '2187 Cruger Ave # 5C'",
         "Input: '2720 Grand Concourse 201' → Output: '2720 Grand Concourse 201'",
         "Input: '3154 Randall Avenue 3154 Randall Avenue' → Output: '3154 Randall Ave'",
         "Input: '42 Herriot St 4fe' → Output: '42 Herriot St 4FE'",
@@ -456,26 +459,26 @@ def llm_correct(address_line: str, compounds: List[str], model_name: str, *,
     ]
     fewshot_block = "\n".join(base_examples + ex_lines)
 
-    # Dynamic policy derived from Word doc + dataset:
+    # Dynamic policy derived from your standard:
     unit_policy = {
-        "preserve": "Preserve the unit style from input; if input used '#', keep '#'; if unlabeled trailing unit like '4C', keep unlabeled.",
+        "preserve": "Preserve the unit style from input; if input used '#', keep '#'; if an unlabeled trailing unit like '4C' exists, keep unlabeled.",
         "apt": "Use 'Apt <value>' for units (convert '# <value>' and unlabeled units to 'Apt <value>').",
         "hash": "Use '# <value>' for units (convert 'Apt/Ste/Rm <value>' and unlabeled units to '# <value>').",
         "none": "Do not label units; keep as trailing token (e.g., '55 Halley St 4C').",
     }[unit_style]
 
     sys_prompt = (
-        "You are a strict address-line normalizer for U.S. addresses. Output ONE line only (no city/state/ZIP).\n"
-        "Follow these rules (Word doc standards + dataset conventions):\n"
+        f"You are a strict address-line normalizer for U.S. addresses. Output ONE line only (no city/state/ZIP).\n"
+        "Follow these rules (internal standards + USPS conventions):\n"
         "• Strip any trailing city/state or ZIP if present in input.\n"
         "• Cardinal directions: abbreviate N, S, E, W, NE, NW, SE, SW when they are directionals; DO NOT change proper names like 'West St' or 'North Ave'.\n"
         "• Use USPS street-type abbreviations only on the terminal street-type word (St, Ave, Blvd, Rd, Dr, Ln, Ter, Pl, Ct, Cir, Pkwy, Hwy, etc.). Do not alter interior proper-name words like 'Centre' in 'Centre Ave'.\n"
         "• PO Boxes must be 'PO Box <value>'.\n"
-        "• {unit_policy}\n"
+        f"• {unit_policy}\n"
         "• Keep 'Bsmt' as-is; 'Floor' → 'Fl'; 'Penthouse'/'PH' → 'Ph'.\n"
-        "• Remove special characters except an accepted '# <unit>' pattern when used for unit style.\n"
+        "• Remove special characters except an accepted '# <unit>' pattern when the style is 'hash'.\n"
         "• Deduplicate accidental repeats, title case, single spaces only. Do NOT hallucinate or add data.\n\n"
-        "Examples:\n" + fewshot_block + "\n"
+        f"Examples:\n{fewshot_block}\n"
     )
 
     try:
@@ -490,10 +493,12 @@ def llm_correct(address_line: str, compounds: List[str], model_name: str, *,
         out = resp.choices[0].message.content.strip()
     except RateLimitError:
         time.sleep(5)
-        return llm_correct(address_line, compounds, model_name,
-                           unit_style=unit_style,
-                           infer_unlabeled_unit=infer_unlabeled_unit,
-                           preserve_proper_directionals=preserve_proper_directionals)
+        return llm_correct(
+            address_line, compounds, model_name,
+            unit_style=unit_style,
+            infer_unlabeled_unit=infer_unlabeled_unit,
+            preserve_proper_directionals=preserve_proper_directionals
+        )
     except Exception as e:
         return f"[LLM ERROR] {e}"
 
@@ -504,7 +509,6 @@ def llm_correct(address_line: str, compounds: List[str], model_name: str, *,
 # =========================
 # Canonicalization for comparison
 # =========================
-
 def canonicalize_for_compare(s: str) -> str:
     if s is None:
         return ""
@@ -516,7 +520,6 @@ def canonicalize_for_compare(s: str) -> str:
 # =========================
 # Mismatch analysis → suggestions (LLM-assisted, structured JSON)
 # =========================
-
 def explain_mismatch(raw: str, predicted: str, correct: str, model_name: str) -> Dict:
     """Return a dict with reason, and safe rule/few-shot suggestions."""
     prompt = (
@@ -557,12 +560,15 @@ def explain_mismatch(raw: str, predicted: str, correct: str, model_name: str) ->
         }
         return {"reason": data.get("reason", ""), "rule_suggestion": rule, "few_shot_hint": few}
     except Exception:
-        return {"reason": "Token/ordering difference or abbreviation variance.", "rule_suggestion": {"pattern": "", "replacement": "", "where": "post"}, "few_shot_hint": {"input": raw, "output": correct}}
+        return {
+            "reason": "Token/ordering difference or abbreviation variance.",
+            "rule_suggestion": {"pattern": "", "replacement": "", "where": "post"},
+            "few_shot_hint": {"input": raw, "output": correct}
+        }
 
 # =========================
 # UI
 # =========================
-
 st.title("📬 Address Cleaner & Formatter (CSV + Adaptive Learning)")
 st.write(
     "Rules + LLM pipeline: merge lines → strip city/state/ZIP noise → apply deterministic rules → apply LLM with your standard → output ONE corrected address line. "
@@ -582,11 +588,17 @@ model_name = st.sidebar.selectbox("LLM model", ["gpt-4o-mini", "gpt-4", "gpt-4o"
 
 # Formatting policy toggles (tuned to your reference dataset by default)
 st.sidebar.subheader("Formatting policy")
-unit_style = st.sidebar.selectbox("Unit label style", ["preserve", "hash", "apt", "none"], index=0,
-                                  help="How to render unit numbers by default")
-infer_unlabeled_unit = st.sidebar.checkbox("Infer unlabeled trailing tokens as unit", value=False,
-                                           help="If OFF, do not auto-insert 'Apt' for trailing tokens like '4C'.")
-preserve_proper_directionals = st.sidebar.checkbox("Keep proper directional streets spelled out (West St, North Ave)", value=True)
+unit_style = st.sidebar.selectbox(
+    "Unit label style", ["preserve", "hash", "apt", "none"], index=0,
+    help="How to render unit numbers by default"
+)
+infer_unlabeled_unit = st.sidebar.checkbox(
+    "Infer unlabeled trailing tokens as unit", value=False,
+    help="If OFF, do not auto-insert 'Apt' for trailing tokens like '4C'."
+)
+preserve_proper_directionals = st.sidebar.checkbox(
+    "Keep proper directional streets spelled out (West St, North Ave)", value=True
+)
 
 st.sidebar.subheader("Adaptive Learning")
 enable_learning = st.sidebar.checkbox("Enable adaptive learning", value=True)
@@ -601,7 +613,6 @@ if st.sidebar.button("Export learning store"):
 compounds = DEFAULT_COMPOUNDS.copy()
 if compound_extra.strip():
     compounds.extend([c.strip().lower() for c in compound_extra.split(",") if c.strip()])
-
 
 def normalize_id_series(s: pd.Series) -> pd.Series:
     return (
@@ -682,7 +693,9 @@ if mode.startswith("Evaluation"):
         # Build RawAddress
         if raw_line2_col != "<none>" and raw_line2_col in raw_df.columns:
             raw_df["RawAddress"] = raw_df.apply(
-                lambda r: f"{r[raw_line1_col]} {r[raw_line2_col]}".strip() if pd.notnull(r[raw_line2_col]) and str(r[raw_line2_col]).strip() != "" else str(r[raw_line1_col]),
+                lambda r: f"{r[raw_line1_col]} {r[raw_line2_col]}".strip()
+                if pd.notnull(r[raw_line2_col]) and str(r[raw_line2_col]).strip() != ""
+                else str(r[raw_line1_col]),
                 axis=1,
             )
         else:
@@ -698,14 +711,20 @@ if mode.startswith("Evaluation"):
         results = []
         total = len(raw_df)
         for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
-            interim = rule_clean(raw, compounds,
-                                 unit_style=unit_style,
-                                 infer_unlabeled_unit=infer_unlabeled_unit,
-                                 preserve_proper_directionals=preserve_proper_directionals)
-            pred = llm_correct(interim, compounds, model_name,
-                               unit_style=unit_style,
-                               infer_unlabeled_unit=infer_unlabeled_unit,
-                               preserve_proper_directionals=preserve_proper_directionals) if use_llm else interim
+            interim = rule_clean(
+                raw, compounds,
+                unit_style=unit_style,
+                infer_unlabeled_unit=infer_unlabeled_unit,
+                preserve_proper_directionals=preserve_proper_directionals
+            )
+            pred = (
+                llm_correct(
+                    interim, compounds, model_name,
+                    unit_style=unit_style,
+                    infer_unlabeled_unit=infer_unlabeled_unit,
+                    preserve_proper_directionals=preserve_proper_directionals
+                ) if use_llm else interim
+            )
             pred = re.sub(r"\s+", " ", pred).strip()
             results.append(pred)
             placeholder.progress(min(i / max(1, total), 1.0))
@@ -778,7 +797,12 @@ if mode.startswith("Evaluation"):
                 if go and max_analyze > 0:
                     sub_nm = non_matches.head(max_analyze)
                     for _, r in sub_nm.iterrows():
-                        expl = explain_mismatch(str(r.get("RawAddress", "")), str(r.get("PredictedAddress", "")), str(r.get("CorrectAddress", "")), model_name)
+                        expl = explain_mismatch(
+                            str(r.get("RawAddress", "")),
+                            str(r.get("PredictedAddress", "")),
+                            str(r.get("CorrectAddress", "")),
+                            model_name
+                        )
                         sugg_rows.append({
                             "RawAddress": r.get("RawAddress", ""),
                             "PredictedAddress": r.get("PredictedAddress", ""),
@@ -832,7 +856,7 @@ if mode.startswith("Evaluation"):
         csv_buf = io.StringIO()
         out_cols = [c for c in ["ID" if "ID" in combo.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress", "ExactMatch"] if c in combo.columns]
         combo[out_cols].to_csv(csv_buf, index=False)
-        st.download_button("📥 Download Evaluation Results (CSV)", data=csv_buf.getvalue(), file_name="address_evaluation_results.csv", mime="text/csv")
+        st.download_button("📥 Download Evaluation Results (CSV)", data=csv_buf.getvalue(), file_name="address_evaluation_results.csv")
 
 # =========================
 # PRODUCTION MODE
