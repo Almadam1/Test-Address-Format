@@ -91,7 +91,7 @@ def correct_with_llm(prompt_address):
 st.title("📬 Address Cleaner & Formatter")
 st.write("Upload a dataset with `AddrLine1` and `AddrLine2`. The app will return corrected addresses.")
 
-uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload Excel File", type=["csv"])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
@@ -116,6 +116,6 @@ if uploaded_file:
     st.download_button(
         label="📥 Download Corrected Addresses",
         data=df.to_excel(index=False, engine='openpyxl'),
-        file_name="corrected_addresses.xlsx",
+        file_name="corrected_addresses.csv",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
