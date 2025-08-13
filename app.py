@@ -252,6 +252,11 @@ if raw_file and correct_file:
         raw_df["RawAddress"] = raw_df[raw_line1_col].astype(str)
 
     # Process RawAddress → Predicted
+    # Ensure normalized IDs exist before processing so predictions can be keyed and merged correctly
+    if id_col != "<none>":
+        raw_df["_id_norm"] = raw_df[id_col].astype(str).str.strip().str.replace('\.0$', '', regex=True)
+        cor_df["_id_norm"] = cor_df[id_col].astype(str).str.strip().str.replace('\.0$', '', regex=True)
+
     st.subheader("Processing")
     placeholder = st.empty()
     results = []
@@ -268,16 +273,35 @@ if raw_file and correct_file:
         results.append(pred)
         placeholder.progress(min(len(results) / max(1, len(raw_df)), 1.0))
 
-    pred_df = pd.DataFrame({"PredictedAddress": results})
+    # Key predictions by normalized ID when available so alignment survives merges/sorting
+    if id_col != "<none>":
+        pred_df = pd.DataFrame({"_id_norm": raw_df["_id_norm"].tolist(), "PredictedAddress": results})
+    else:
+        pred_df = pd.DataFrame({"PredictedAddress": results})
 
     # Align and compare
     if id_col != "<none>":
+        # Normalize ID dtype/format in both dataframes to avoid join mismatches (e.g., 20240552 vs 20240552.0)
+        raw_df["_id_norm"] = raw_df[id_col].astype(str).str.strip().str.replace('\.0$', '', regex=True)
+        cor_df["_id_norm"] = cor_df[id_col].astype(str).str.strip().str.replace('\.0$', '', regex=True)
+
+        # Merge on normalized ID
+        base_cols = [id_col, "_id_norm", "RawAddress"]
         combo = (
-            raw_df[[id_col, "RawAddress"]]
-            .reset_index(drop=True)
-            .merge(cor_df[[id_col, cor_addr_col]], on=id_col, how="inner")
+            raw_df[base_cols]
+              .reset_index(drop=True)
+              .merge(
+                  cor_df[[id_col, "_id_norm", cor_addr_col]].reset_index(drop=True),
+                  on="_id_norm",
+                  how="inner",
+                  suffixes=("_RAW", "_COR")
+              )
         )
-        combo = pd.concat([combo.reset_index(drop=True), pred_df.reset_index(drop=True)], axis=1)
+        # Keep a clean view
+        # Merge predictions on normalized ID to prevent index-based misalignment
+        combo = combo.merge(pred_df, on="_id_norm", how="left")
+        combo = combo.rename(columns={cor_addr_col: "CorrectAddress"})
+        st.caption(f"Joined rows used for accuracy: {len(combo)}")
     else:
         matched_n = min(len(raw_df), len(cor_df))
         raw_sub = raw_df.head(matched_n)
