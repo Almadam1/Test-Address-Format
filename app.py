@@ -571,8 +571,7 @@ def explain_mismatch(raw: str, predicted: str, correct: str, model_name: str) ->
 # =========================
 st.title("📬 Address Cleaner & Formatter (CSV + Adaptive Learning)")
 st.write(
-    "Rules + LLM pipeline: merge lines → strip city/state/ZIP noise → apply deterministic rules → apply LLM with your standard → output ONE corrected address line. "
-    "Use **Evaluation** to compare vs ground-truth, capture **non-exact matches**, and optionally learn from them. Use **Production** to generate a corrected CSV."
+    "The app always uses **Rules → LLM**. Click **Submit** to process and watch progress update in real time."
 )
 
 st.sidebar.header("Options")
@@ -581,7 +580,6 @@ mode = st.sidebar.radio("Mode", [
     "Production (generate corrected CSV)",
 ])
 max_rows = st.sidebar.number_input("Max rows to process", min_value=1, max_value=5000, value=DEFAULT_MAX_ROWS, step=1)
-use_llm = st.sidebar.checkbox("Use LLM enhancement (after rules)", value=True)
 compound_extra = st.sidebar.text_area("Extra compound street names to preserve (comma-separated)", value="")
 sort_by_id = st.sidebar.checkbox("Sort results by ID (when ID is used)", value=True)
 model_name = st.sidebar.selectbox("LLM model", ["gpt-4o-mini", "gpt-4", "gpt-4o"], index=0)
@@ -629,7 +627,9 @@ if mode.startswith("Evaluation"):
     raw_file = st.file_uploader("Upload RAW addresses (CSV)", type=["csv"], key="raw_eval")
     correct_file = st.file_uploader("Upload CORRECT addresses (CSV)", type=["csv"], key="correct_eval")
 
-    if raw_file and correct_file:
+    submitted = st.button("▶️ Submit & Run Evaluation", disabled=not (raw_file and correct_file))
+
+    if raw_file and correct_file and submitted:
         raw_df = pd.read_csv(raw_file)
         cor_df = pd.read_csv(correct_file)
 
@@ -706,10 +706,11 @@ if mode.startswith("Evaluation"):
             raw_df["_id_norm"] = normalize_id_series(raw_df[id_col])
             cor_df["_id_norm"] = normalize_id_series(cor_df[id_col])
 
-        st.subheader("Processing")
-        placeholder = st.empty()
+        st.subheader("Processing (Rules → LLM)")
+        progress = st.progress(0.0)
         results = []
         total = len(raw_df)
+
         for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
             interim = rule_clean(
                 raw, compounds,
@@ -717,17 +718,15 @@ if mode.startswith("Evaluation"):
                 infer_unlabeled_unit=infer_unlabeled_unit,
                 preserve_proper_directionals=preserve_proper_directionals
             )
-            pred = (
-                llm_correct(
-                    interim, compounds, model_name,
-                    unit_style=unit_style,
-                    infer_unlabeled_unit=infer_unlabeled_unit,
-                    preserve_proper_directionals=preserve_proper_directionals
-                ) if use_llm else interim
+            pred = llm_correct(
+                interim, compounds, model_name,
+                unit_style=unit_style,
+                infer_unlabeled_unit=infer_unlabeled_unit,
+                preserve_proper_directionals=preserve_proper_directionals
             )
             pred = re.sub(r"\s+", " ", pred).strip()
             results.append(pred)
-            placeholder.progress(min(i / max(1, total), 1.0))
+            progress.progress(min(i / max(1, total), 1.0))
 
         # Predictions keyed by normalized ID when available
         if id_col != "<none>":
@@ -789,7 +788,7 @@ if mode.startswith("Evaluation"):
             st.dataframe(non_matches[nm_cols].head(25), use_container_width=True)
 
             # LLM-assisted mismatch explanations
-            if enable_learning and use_llm:
+            if enable_learning:
                 st.markdown("**Analyze mismatches and propose learning rules/examples**")
                 sugg_rows = []
                 max_analyze = st.slider("How many non-matches to analyze now?", 0, min(100, len(non_matches)), value=min(25, len(non_matches)))
@@ -848,7 +847,10 @@ if mode.startswith("Evaluation"):
                                 store["learning_pairs"].append(lp)
                         st.success(f"Applied: {applied_rules} rules, added {added_few} few-shot examples. Export the learning store from the sidebar to persist.")
 
-            # Download non-exact matches CSV
+        # Downloads
+        # Non-exact matches CSV
+        if len(non_matches) > 0:
+            nm_cols = [c for c in ["ID" if "ID" in non_matches.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress"] if c in non_matches.columns]
             nm_buf = io.StringIO(); non_matches[nm_cols].to_csv(nm_buf, index=False)
             st.download_button("⬇️ Download Non-Exact Matches (CSV)", data=nm_buf.getvalue(), file_name="address_non_exact_matches.csv", mime="text/csv")
 
@@ -864,7 +866,10 @@ if mode.startswith("Evaluation"):
 else:
     st.header("🚀 Production: Generate Corrected Addresses CSV")
     raw_file_p = st.file_uploader("Upload RAW addresses (CSV)", type=["csv"], key="raw_prod")
-    if raw_file_p:
+
+    submitted_prod = st.button("▶️ Submit & Process Addresses", disabled=not raw_file_p)
+
+    if raw_file_p and submitted_prod:
         raw_df = pd.read_csv(raw_file_p)
         raw_cols = list(raw_df.columns)
 
@@ -895,10 +900,11 @@ else:
                 .str.replace(r"\.0$", "", regex=True)
             )
 
-        st.subheader("Processing")
-        placeholder = st.empty()
+        st.subheader("Processing (Rules → LLM)")
+        progress = st.progress(0.0)
         results = []
         total = len(raw_df)
+
         for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
             interim = rule_clean(
                 raw,
@@ -907,21 +913,17 @@ else:
                 infer_unlabeled_unit=infer_unlabeled_unit,
                 preserve_proper_directionals=preserve_proper_directionals,
             )
-            pred = (
-                llm_correct(
-                    interim,
-                    compounds,
-                    model_name,
-                    unit_style=unit_style,
-                    infer_unlabeled_unit=infer_unlabeled_unit,
-                    preserve_proper_directionals=preserve_proper_directionals,
-                )
-                if use_llm
-                else interim
+            pred = llm_correct(
+                interim,
+                compounds,
+                model_name,
+                unit_style=unit_style,
+                infer_unlabeled_unit=infer_unlabeled_unit,
+                preserve_proper_directionals=preserve_proper_directionals,
             )
             pred = re.sub(r"\s+", " ", pred).strip()
             results.append(pred)
-            placeholder.progress(min(i / max(1, total), 1.0))
+            progress.progress(min(i / max(1, total), 1.0))
 
         # Build output CSV (ID + CorrectedAddress, plus Raw for audit)
         out_df = pd.DataFrame({"CorrectedAddress": results})
