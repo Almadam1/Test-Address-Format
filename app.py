@@ -319,28 +319,48 @@ def normalize_unit_token(tok: str) -> str:
     return tok
 
 # =========================
-# Robust chat helpers with timeout & retries
+# Robust chat helpers with validation & retries
 # =========================
 
-def _chat_once(model: str, messages: list, *, request_timeout: float = 60.0):
-    return client.chat.completions.create(
+def _chat_once(model: str, messages: list, *, request_timeout: Optional[float] = None):
+    """
+    One synchronous chat call.
+    NOTE: We intentionally do NOT pass a 'timeout' kwarg because some openai-python builds
+    treat it differently. If you want a hard timeout, use a network-level proxy timeout instead.
+    """
+    resp = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=0.1,
-        timeout=request_timeout,
+        # intentionally not passing 'timeout' here
     )
+    # Validate response object
+    if not resp or not getattr(resp, "choices", None):
+        raise RuntimeError("Empty/invalid completion response (no choices).")
+    if not resp.choices or not getattr(resp.choices[0], "message", None):
+        raise RuntimeError("Completion response missing message.")
+    if not isinstance(resp.choices[0].message.content, str):
+        raise RuntimeError("Completion message content is not a string.")
+    return resp
 
 
 def _chat_with_retries(model: str, messages: list, *, max_retries: int = 3, base_delay: float = 1.0):
+    last_err = None
     for attempt in range(max_retries):
         try:
             return _chat_once(model, messages)
-        except RateLimitError:
+        except RateLimitError as e:
+            last_err = e
             time.sleep(base_delay * (2 ** attempt))
-        except Exception:
-            if attempt == max_retries - 1:
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+            else:
                 raise
-            time.sleep(base_delay * (2 ** attempt))
+    if last_err:
+        raise last_err
+    raise RuntimeError("LLM call failed without an exception.")
 
 # =========================
 # Rule-based cleaner (updated, safer)
@@ -349,7 +369,7 @@ def _chat_with_retries(model: str, messages: list, *, max_retries: int = 3, base
 def rule_clean(
     address: str,
     compounds: List[str],
-    *,
+    * ,
     unit_style: str = "preserve",
     infer_unlabeled_unit: bool = False,
     keep_hash_if_present: bool = True,           # kept for compatibility
@@ -379,7 +399,7 @@ def rule_clean(
     # Protect compounds (and proper directional streets) from abbreviation
     s = protect_compounds(s, compounds)
 
-    # Normalize PO Box early (before punctuation removal drops clues)
+    # Normalize PO Box early (keep number)
     s = re.sub(
         r"\b(?:p\.?\s*o\.?|po)\s*(?:box|bx|#)?\s*([A-Za-z0-9-]+)\b",
         r"po box \1",
@@ -425,7 +445,6 @@ def rule_clean(
             elif unit_style == "hash":
                 s = re.sub(r"\b([0-9][a-z0-9-]{0,7})$", r"# \1", s)
             else:
-                # 'none' → keep as unlabeled token
                 pass
 
     # Normalize trailing unit token case if present and unlabeled
@@ -443,7 +462,6 @@ def rule_clean(
             s = re.sub(r"\s#\s*([a-z0-9-]+)\b", r" apt \1", s)
         elif unit_style == "hash":
             s = re.sub(r"\b(apt|ste|rm|unit)\s+([a-z0-9-]+)\b", r"# \2", s)
-            # Convert trailing unlabeled to "# <val>" after a street suffix
             s = re.sub(
                 r"\b(ave|st|blvd|dr|rd|ln|ter|pl|ct|cir|pkwy|hwy|way|loop|trl|expy)\b\s+([0-9][a-z0-9-]{0,7})$",
                 r"\1 # \2",
@@ -477,7 +495,7 @@ def llm_correct(
     address_line: str,
     compounds: List[str],
     model_name: str,
-    *,
+    * ,
     unit_style: str,
     infer_unlabeled_unit: bool,
     preserve_proper_directionals: bool
@@ -536,7 +554,12 @@ def llm_correct(
             max_retries=3,
             base_delay=1.0,
         )
-        out = resp.choices[0].message.content.strip()
+        if not resp or not getattr(resp, "choices", None):
+            raise RuntimeError("Empty/invalid completion response (no choices).")
+        out = resp.choices[0].message.content
+        if not isinstance(out, str):
+            raise RuntimeError("Completion message content is not a string.")
+        out = out.strip()
     except Exception as e:
         st.warning(f"LLM error on address '{address_line[:80]}...': {e}. Falling back to rules-only for this row.")
         return rule_clean(address_line, compounds, unit_style=unit_style, infer_unlabeled_unit=infer_unlabeled_unit)
