@@ -4,13 +4,21 @@ import re
 import io
 import json
 import time
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from openai import OpenAI, RateLimitError
 
 # =========================
-# OpenAI client (v1 syntax)
+# OpenAI client (v1 syntax) with validation & caching
 # =========================
-client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+@st.cache_resource
+def get_openai_client() -> OpenAI:
+    api_key = st.secrets.get("OPENAI_API_KEY") or ""
+    if not api_key:
+        st.error("Missing OPENAI_API_KEY in st.secrets. Add it and rerun.")
+        st.stop()
+    return OpenAI(api_key=api_key)
+
+client = get_openai_client()
 
 # =========================
 # Config / Options
@@ -130,6 +138,7 @@ DEFAULT_COMPOUNDS = [
 # =========================
 # Helpers: compound handling
 # =========================
+
 def protect_compounds(s: str, compounds: List[str]) -> str:
     s_low = str(s)
     for name in compounds:
@@ -141,6 +150,7 @@ def protect_compounds(s: str, compounds: List[str]) -> str:
         for pat in patterns:
             s_low = re.sub(pat, token, s_low, flags=re.IGNORECASE)
     return s_low
+
 
 def restore_compounds(s: str, compounds: List[str]) -> str:
     out = str(s)
@@ -154,6 +164,7 @@ def restore_compounds(s: str, compounds: List[str]) -> str:
 # =========================
 # Adaptive Learning Store
 # =========================
+
 def get_store() -> Dict:
     if "learning_pairs" not in st.session_state:
         st.session_state.learning_pairs = []  # list of {raw, predicted, correct}
@@ -168,6 +179,7 @@ def get_store() -> Dict:
         "custom_rules": st.session_state.custom_rules,
         "fewshot_examples": st.session_state.fewshot_examples,
     }
+
 
 def load_learning_store(uploaded_file):
     _ = get_store()
@@ -194,6 +206,7 @@ def load_learning_store(uploaded_file):
             pass
     return get_store()
 
+
 def _ingest_store_obj(obj: Dict):
     store = get_store()
     for k in ["learning_pairs", "custom_rules", "fewshot_examples"]:
@@ -202,6 +215,7 @@ def _ingest_store_obj(obj: Dict):
             for item in obj[k]:
                 if item not in existing:
                     existing.append(item)
+
 
 def export_learning_store() -> str:
     store = get_store()
@@ -212,8 +226,10 @@ def export_learning_store() -> str:
 # =========================
 # Light similarity for few-shot selection
 # =========================
+
 def _token_set(s: str) -> set:
     return set(re.findall(r"[a-z0-9]+", s.lower()))
+
 
 def most_similar_examples(inp: str, k: int = 6) -> List[Tuple[str, str]]:
     exs = get_store()["fewshot_examples"]
@@ -232,6 +248,7 @@ def most_similar_examples(inp: str, k: int = 6) -> List[Tuple[str, str]]:
 # =========================
 # Adaptive rules application
 # =========================
+
 def apply_custom_rules(s: str, where: str = "pre") -> str:
     for rule in get_store()["custom_rules"]:
         if rule.get("where", "pre") in (where, "both"):
@@ -244,6 +261,7 @@ def apply_custom_rules(s: str, where: str = "pre") -> str:
 # =========================
 # Utilities
 # =========================
+
 def strip_city_state_zip(s: str) -> str:
     """
     Remove trailing ZIP (5/9), and trailing state codes like 'NY' possibly repeated.
@@ -262,6 +280,7 @@ def strip_city_state_zip(s: str) -> str:
         i -= 1
         count += 1
     return " ".join(tokens[:i]) if i else ""
+
 
 def abbrev_terminal_suffix(s: str) -> str:
     """
@@ -292,6 +311,7 @@ def abbrev_terminal_suffix(s: str) -> str:
         return " ".join(parts)
     return s
 
+
 def normalize_unit_token(tok: str) -> str:
     # Uppercase alphanum units like 4c → 4C, 24d → 24D, 4fe → 4FE
     if re.fullmatch(r"[0-9]+[a-z0-9-]*", tok.lower()):
@@ -299,16 +319,41 @@ def normalize_unit_token(tok: str) -> str:
     return tok
 
 # =========================
+# Robust chat helpers with timeout & retries
+# =========================
+
+def _chat_once(model: str, messages: list, *, request_timeout: float = 60.0):
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.1,
+        timeout=request_timeout,
+    )
+
+
+def _chat_with_retries(model: str, messages: list, *, max_retries: int = 3, base_delay: float = 1.0):
+    for attempt in range(max_retries):
+        try:
+            return _chat_once(model, messages)
+        except RateLimitError:
+            time.sleep(base_delay * (2 ** attempt))
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+
+# =========================
 # Rule-based cleaner (updated, safer)
 # =========================
+
 def rule_clean(
     address: str,
     compounds: List[str],
     *,
     unit_style: str = "preserve",
     infer_unlabeled_unit: bool = False,
-    keep_hash_if_present: bool = True,           # kept for compatibility, not used directly
-    preserve_proper_directionals: bool = True    # behavior covered via compound protection
+    keep_hash_if_present: bool = True,           # kept for compatibility
+    preserve_proper_directionals: bool = True    # via compound protection
 ) -> str:
     """
     unit_style: one of ['preserve','apt','hash','none']
@@ -353,7 +398,7 @@ def rule_clean(
     s = re.sub(r'\bbasement\b', 'bsmt', s, flags=re.IGNORECASE)
     s = re.sub(r'\bfloor\b', 'fl', s, flags=re.IGNORECASE)
     s = re.sub(r'\bpenthouse\b', 'ph', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bph\b', 'ph', s, flags=re.IGNORECASE)  # keep PH/Ph as unit label
+    s = re.sub(r'\bph\b', 'ph', s, flags=re.IGNORECASE)
 
     # Remove stray commas/periods (we've already normalized #, PO Box)
     s = re.sub(r"[,.]", "", s)
@@ -365,7 +410,7 @@ def rule_clean(
     # Apply terminal street-type abbreviation only
     s = abbrev_terminal_suffix(s)
 
-    # Move leading unit to end (e.g., 'apt a 19204 39th ave' -> '19204 39th ave apt a')
+    # Move leading unit to end
     m = re.match(r'^(?:\s*(apt|ste|rm|unit|ph|fl|bsmt)\s+([a-z0-9-]+)\s+)(.+)$', s)
     if m:
         unit_lbl, unit_val, rest = m.groups()
@@ -427,6 +472,7 @@ def rule_clean(
 # =========================
 # LLM correction (address line) with adaptive few-shot
 # =========================
+
 def llm_correct(
     address_line: str,
     compounds: List[str],
@@ -459,7 +505,6 @@ def llm_correct(
     ]
     fewshot_block = "\n".join(base_examples + ex_lines)
 
-    # Dynamic policy derived from your standard:
     unit_policy = {
         "preserve": "Preserve the unit style from input; if input used '#', keep '#'; if an unlabeled trailing unit like '4C' exists, keep unlabeled.",
         "apt": "Use 'Apt <value>' for units (convert '# <value>' and unlabeled units to 'Apt <value>').",
@@ -482,25 +527,19 @@ def llm_correct(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[
+        resp = _chat_with_retries(
+            model_name,
+            [
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": pre},
             ],
-            temperature=0.1,
+            max_retries=3,
+            base_delay=1.0,
         )
         out = resp.choices[0].message.content.strip()
-    except RateLimitError:
-        time.sleep(5)
-        return llm_correct(
-            address_line, compounds, model_name,
-            unit_style=unit_style,
-            infer_unlabeled_unit=infer_unlabeled_unit,
-            preserve_proper_directionals=preserve_proper_directionals
-        )
     except Exception as e:
-        return f"[LLM ERROR] {e}"
+        st.warning(f"LLM error on address '{address_line[:80]}...': {e}. Falling back to rules-only for this row.")
+        return rule_clean(address_line, compounds, unit_style=unit_style, infer_unlabeled_unit=infer_unlabeled_unit)
 
     out = restore_compounds(out, compounds)
     out = re.sub(r"\s+", " ", out).strip()
@@ -509,6 +548,7 @@ def llm_correct(
 # =========================
 # Canonicalization for comparison
 # =========================
+
 def canonicalize_for_compare(s: str) -> str:
     if s is None:
         return ""
@@ -520,6 +560,7 @@ def canonicalize_for_compare(s: str) -> str:
 # =========================
 # Mismatch analysis → suggestions (LLM-assisted, structured JSON)
 # =========================
+
 def explain_mismatch(raw: str, predicted: str, correct: str, model_name: str) -> Dict:
     """Return a dict with reason, and safe rule/few-shot suggestions."""
     prompt = (
@@ -530,13 +571,14 @@ def explain_mismatch(raw: str, predicted: str, correct: str, model_name: str) ->
         f"RAW: {raw}\nPREDICTED: {predicted}\nCORRECT: {correct}\n"
     )
     try:
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[
+        resp = _chat_with_retries(
+            model_name,
+            [
                 {"role": "system", "content": "Return valid JSON only."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.0,
+            max_retries=3,
+            base_delay=1.0,
         )
         txt = resp.choices[0].message.content.strip()
         data = json.loads(txt)
@@ -569,9 +611,11 @@ def explain_mismatch(raw: str, predicted: str, correct: str, model_name: str) ->
 # =========================
 # UI
 # =========================
+
 st.title("📬 Address Cleaner & Formatter (CSV + Adaptive Learning)")
 st.write(
-    "The app always uses **Rules → LLM**. Click **Submit** to process and watch progress update in real time."
+    "Rules + LLM pipeline: merge lines → strip city/state/ZIP noise → apply deterministic rules → apply LLM with your standard → output ONE corrected address line. "
+    "Use **Evaluation** to compare vs ground-truth, capture **non-exact matches**, and optionally learn from them. Use **Production** to generate a corrected CSV."
 )
 
 st.sidebar.header("Options")
@@ -582,7 +626,17 @@ mode = st.sidebar.radio("Mode", [
 max_rows = st.sidebar.number_input("Max rows to process", min_value=1, max_value=5000, value=DEFAULT_MAX_ROWS, step=1)
 compound_extra = st.sidebar.text_area("Extra compound street names to preserve (comma-separated)", value="")
 sort_by_id = st.sidebar.checkbox("Sort results by ID (when ID is used)", value=True)
-model_name = st.sidebar.selectbox("LLM model", ["gpt-4o-mini", "gpt-4", "gpt-4o"], index=0)
+model_name = st.sidebar.selectbox("LLM model", ["gpt-4o-mini", "gpt-4o", "gpt-4"], index=0)
+
+# Quick health check
+if st.sidebar.button("🔎 Quick LLM health check"):
+    try:
+        t0 = time.time()
+        resp = _chat_with_retries(model_name, [{"role": "user", "content": "ping"}], max_retries=1, base_delay=0.5)
+        dt = (time.time() - t0)
+        st.sidebar.success(f"LLM reachable. Latency: {dt:.2f}s. Model: {model_name}")
+    except Exception as e:
+        st.sidebar.error(f"LLM call failed: {e}. Check API key, model access, or network egress.")
 
 # Formatting policy toggles (tuned to your reference dataset by default)
 st.sidebar.subheader("Formatting policy")
@@ -612,12 +666,21 @@ compounds = DEFAULT_COMPOUNDS.copy()
 if compound_extra.strip():
     compounds.extend([c.strip().lower() for c in compound_extra.split(",") if c.strip()])
 
+
 def normalize_id_series(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
          .str.strip()
          .str.replace(r"\.0$", "", regex=True)
     )
+
+# ===== Helpers: autodetect columns =====
+
+def _pick(colnames: List[str], pref_list: List[str], default: Optional[str] = None) -> Optional[str]:
+    for p in pref_list:
+        if p in colnames:
+            return p
+    return default if default is not None else (colnames[0] if colnames else None)
 
 # =========================
 # EVALUATION MODE
@@ -627,68 +690,34 @@ if mode.startswith("Evaluation"):
     raw_file = st.file_uploader("Upload RAW addresses (CSV)", type=["csv"], key="raw_eval")
     correct_file = st.file_uploader("Upload CORRECT addresses (CSV)", type=["csv"], key="correct_eval")
 
-    submitted = st.button("▶️ Submit & Run Evaluation", disabled=not (raw_file and correct_file))
-
-    if raw_file and correct_file and submitted:
+    if raw_file and correct_file:
         raw_df = pd.read_csv(raw_file)
         cor_df = pd.read_csv(correct_file)
-
-        st.subheader("Select Columns")
-        raw_cols = list(raw_df.columns)
-        cor_cols = list(cor_df.columns)
-
-        raw_line1_col = st.selectbox("Raw: Address Line 1 column", options=raw_cols, index=min(0, len(raw_cols)-1), key="re_l1")
-        raw_line2_col = st.selectbox("Raw: Address Line 2 column (optional)", options=["<none>"] + raw_cols, index=0, key="re_l2")
-        cor_addr_col = st.selectbox("Correct: Address column", options=cor_cols, index=min(0, len(cor_cols)-1), key="re_coraddr")
-
-        id_col_options = ["<none>"] + [c for c in raw_cols if c in cor_cols]
-        id_col = st.selectbox("Optional: ID column present in BOTH files (for joining)", options=id_col_options, index=0, key="re_id")
 
         raw_df = raw_df.head(int(max_rows)).copy()
         cor_df = cor_df.head(int(max_rows)).copy()
 
-        # Matching summary (normalized IDs to match join behavior)
-        if id_col != "<none>":
-            raw_df["_id_norm"] = normalize_id_series(raw_df[id_col])
-            cor_df["_id_norm"] = normalize_id_series(cor_df[id_col])
+        raw_cols = list(raw_df.columns)
+        cor_cols = list(cor_df.columns)
 
-            if sort_by_id:
-                raw_df = raw_df.sort_values("_id_norm").reset_index(drop=True)
-                cor_df = cor_df.sort_values("_id_norm").reset_index(drop=True)
+        # Autodetect
+        auto_raw_line1 = _pick(raw_cols, ["AddrLine1", "Address1", "Address", "Street", "Line1"]) or raw_cols[0]
+        auto_raw_line2 = _pick(raw_cols, ["AddrLine2", "Address2", "Line2"], default="<none>")
+        auto_cor_addr  = _pick(cor_cols,  ["AddrLine1", "Address", "CorrectAddress"]) or cor_cols[0]
+        auto_id = "CWID" if ("CWID" in raw_cols and "CWID" in cor_cols) else "<none>"
 
-            raw_ids = set(raw_df["_id_norm"].dropna().tolist())
-            cor_ids = set(cor_df["_id_norm"].dropna().tolist())
-            matched_ids = raw_ids & cor_ids
-            only_raw = sorted(list(raw_ids - cor_ids))
-            only_cor = sorted(list(cor_ids - raw_ids))
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Matched IDs", len(matched_ids))
-            c2.metric("Only in RAW", len(only_raw))
-            c3.metric("Only in CORRECT", len(only_cor))
-
-            if only_raw or only_cor:
-                st.info(
-                    "Unmatched examples — RAW only: "
-                    + ", ".join(map(str, only_raw[:10]))
-                    + (" …" if len(only_raw) > 10 else "")
-                    + " | CORRECT only: "
-                    + ", ".join(map(str, only_cor[:10]))
-                    + (" …" if len(only_cor) > 10 else "")
-                )
-                or_buf = io.StringIO(); pd.DataFrame({id_col: only_raw}).to_csv(or_buf, index=False); or_buf.seek(0)
-                oc_buf = io.StringIO(); pd.DataFrame({id_col: only_cor}).to_csv(oc_buf, index=False); oc_buf.seek(0)
-                d1, d2 = st.columns(2)
-                d1.download_button("⬇️ IDs only in RAW (CSV)", data=or_buf.getvalue(), file_name="ids_only_in_raw.csv", mime="text/csv")
-                d2.download_button("⬇️ IDs only in CORRECT (CSV)", data=oc_buf.getvalue(), file_name="ids_only_in_correct.csv", mime="text/csv")
-        else:
-            matched_n = min(len(raw_df), len(cor_df))
-            extra_raw = max(0, len(raw_df) - matched_n)
-            extra_cor = max(0, len(cor_df) - matched_n)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Rows aligned by order", matched_n)
-            c2.metric("Extra in RAW", extra_raw)
-            c3.metric("Extra in CORRECT", extra_cor)
+        with st.expander("Edit column selections", expanded=False):
+            raw_line1_col = st.selectbox("Raw: Address Line 1 column", options=raw_cols, index=raw_cols.index(auto_raw_line1))
+            raw_line2_col = st.selectbox("Raw: Address Line 2 column (optional)", options=["<none>"] + raw_cols, index=( ["<none>"] + raw_cols ).index(auto_raw_line2 if auto_raw_line2 in raw_cols else "<none>"))
+            cor_addr_col  = st.selectbox("Correct: Address column", options=cor_cols, index=cor_cols.index(auto_cor_addr))
+            id_col_options = ["<none>"] + [c for c in raw_cols if c in cor_cols]
+            id_col = st.selectbox("Optional: ID column present in BOTH files (for joining)", options=id_col_options, index=id_col_options.index(auto_id))
+        # If user doesn't expand, use autodetected values
+        if 'raw_line1_col' not in locals():
+            raw_line1_col = auto_raw_line1
+            raw_line2_col = auto_raw_line2
+            cor_addr_col = auto_cor_addr
+            id_col = auto_id
 
         # Build RawAddress
         if raw_line2_col != "<none>" and raw_line2_col in raw_df.columns:
@@ -705,160 +734,166 @@ if mode.startswith("Evaluation"):
         if id_col != "<none>":
             raw_df["_id_norm"] = normalize_id_series(raw_df[id_col])
             cor_df["_id_norm"] = normalize_id_series(cor_df[id_col])
-
-        st.subheader("Processing (Rules → LLM)")
-        progress = st.progress(0.0)
-        results = []
-        total = len(raw_df)
-
-        for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
-            interim = rule_clean(
-                raw, compounds,
-                unit_style=unit_style,
-                infer_unlabeled_unit=infer_unlabeled_unit,
-                preserve_proper_directionals=preserve_proper_directionals
-            )
-            pred = llm_correct(
-                interim, compounds, model_name,
-                unit_style=unit_style,
-                infer_unlabeled_unit=infer_unlabeled_unit,
-                preserve_proper_directionals=preserve_proper_directionals
-            )
-            pred = re.sub(r"\s+", " ", pred).strip()
-            results.append(pred)
-            progress.progress(min(i / max(1, total), 1.0))
-
-        # Predictions keyed by normalized ID when available
-        if id_col != "<none>":
-            pred_df = pd.DataFrame({"_id_norm": raw_df["_id_norm"].tolist(), "PredictedAddress": results})
-        else:
-            pred_df = pd.DataFrame({"PredictedAddress": results})
-
-        # Align and compare
-        if id_col != "<none>":
-            base_cols = [id_col, "_id_norm", "RawAddress"]
-            combo = (
-                raw_df[base_cols]
-                  .reset_index(drop=True)
-                  .merge(
-                      cor_df[[id_col, "_id_norm", cor_addr_col]].reset_index(drop=True),
-                      on="_id_norm",
-                      how="inner",
-                      suffixes=("_RAW", "_COR")
-                  )
-            )
-            combo = combo.merge(pred_df, on="_id_norm", how="left")
-            combo = combo.rename(columns={cor_addr_col: "CorrectAddress"})
             if sort_by_id:
-                combo = combo.sort_values("_id_norm").reset_index(drop=True)
-            st.caption(f"Joined rows used for accuracy: {len(combo)}")
-        else:
-            matched_n = min(len(raw_df), len(cor_df))
-            raw_sub = raw_df.head(matched_n)
-            cor_sub = cor_df.head(matched_n)
-            combo = pd.concat([
-                raw_sub[["RawAddress"]].reset_index(drop=True),
-                cor_sub[[cor_addr_col]].rename(columns={cor_addr_col: "CorrectAddress"}).reset_index(drop=True),
-                pred_df.head(matched_n).reset_index(drop=True),
-            ], axis=1)
-            st.caption(f"Rows aligned by order and used for accuracy: {matched_n}")
+                raw_df = raw_df.sort_values("_id_norm").reset_index(drop=True)
+                cor_df = cor_df.sort_values("_id_norm").reset_index(drop=True)
 
-        # Canonical comparison
-        combo["_pred_norm"] = combo["PredictedAddress"].apply(canonicalize_for_compare)
-        combo["_corr_norm"] = combo["CorrectAddress"].apply(canonicalize_for_compare)
-        combo["ExactMatch"] = combo["_pred_norm"] == combo["_corr_norm"]
+        # Submit button for processing
+        st.subheader("Processing")
+        go = st.button("Submit", type="primary")
+        if go:
+            progress = st.progress(0)
+            status = st.empty()
+            results = []
+            total = len(raw_df)
 
-        accuracy = (combo["ExactMatch"].sum() / max(1, len(combo))) * 100.0
-        st.success(f"✅ Accuracy: {accuracy:.2f}% (exact normalized match)")
+            for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
+                interim = rule_clean(
+                    raw, compounds,
+                    unit_style=unit_style,
+                    infer_unlabeled_unit=infer_unlabeled_unit,
+                    preserve_proper_directionals=preserve_proper_directionals
+                )
+                pred = llm_correct(
+                    interim, compounds, model_name,
+                    unit_style=unit_style,
+                    infer_unlabeled_unit=infer_unlabeled_unit,
+                    preserve_proper_directionals=preserve_proper_directionals
+                )
+                pred = re.sub(r"\s+", " ", pred).strip()
+                results.append(pred)
 
-        # Outputs (include clean ID when available)
-        if id_col != "<none>":
-            combo["ID"] = combo["_id_norm"]
+                progress.progress(i / max(1, total))
+                status.text(f"Processed {i}/{total}")
 
-        # Preview
-        st.subheader("Results Preview")
-        preview_cols = [c for c in ["ID" if "ID" in combo.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress", "ExactMatch"] if c in combo.columns]
-        st.dataframe(combo[preview_cols].head(50), use_container_width=True)
+            # Predictions keyed by normalized ID when available
+            if id_col != "<none>":
+                pred_df = pd.DataFrame({"_id_norm": raw_df["_id_norm"].tolist(), "PredictedAddress": results})
+            else:
+                pred_df = pd.DataFrame({"PredictedAddress": results})
 
-        # Non-exact matches + Learning widgets
-        non_matches = combo.loc[~combo["ExactMatch"]].copy()
-        st.subheader(f"❗ Non-exact matches: {len(non_matches)}")
-        if len(non_matches) > 0:
-            nm_cols = [c for c in ["ID" if "ID" in non_matches.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress"] if c in non_matches.columns]
-            st.dataframe(non_matches[nm_cols].head(25), use_container_width=True)
+            # Align and compare
+            if id_col != "<none>":
+                base_cols = [id_col, "_id_norm", "RawAddress"]
+                combo = (
+                    raw_df[base_cols]
+                      .reset_index(drop=True)
+                      .merge(
+                          cor_df[[id_col, "_id_norm", cor_addr_col]].reset_index(drop=True),
+                          on="_id_norm",
+                          how="inner",
+                          suffixes=("_RAW", "_COR")
+                      )
+                )
+                combo = combo.merge(pred_df, on="_id_norm", how="left")
+                combo = combo.rename(columns={cor_addr_col: "CorrectAddress"})
+                if sort_by_id:
+                    combo = combo.sort_values("_id_norm").reset_index(drop=True)
+                st.caption(f"Joined rows used for accuracy: {len(combo)}")
+            else:
+                matched_n = min(len(raw_df), len(cor_df))
+                raw_sub = raw_df.head(matched_n)
+                cor_sub = cor_df.head(matched_n)
+                combo = pd.concat([
+                    raw_sub[["RawAddress"]].reset_index(drop=True),
+                    cor_sub[[cor_addr_col]].rename(columns={cor_addr_col: "CorrectAddress"}).reset_index(drop=True),
+                    pred_df.head(matched_n).reset_index(drop=True),
+                ], axis=1)
+                st.caption(f"Rows aligned by order and used for accuracy: {matched_n}")
 
-            # LLM-assisted mismatch explanations
-            if enable_learning:
-                st.markdown("**Analyze mismatches and propose learning rules/examples**")
-                sugg_rows = []
-                max_analyze = st.slider("How many non-matches to analyze now?", 0, min(100, len(non_matches)), value=min(25, len(non_matches)))
-                go = st.button("🔎 Analyze selected non-matches")
-                if go and max_analyze > 0:
-                    sub_nm = non_matches.head(max_analyze)
-                    for _, r in sub_nm.iterrows():
-                        expl = explain_mismatch(
-                            str(r.get("RawAddress", "")),
-                            str(r.get("PredictedAddress", "")),
-                            str(r.get("CorrectAddress", "")),
-                            model_name
-                        )
-                        sugg_rows.append({
-                            "RawAddress": r.get("RawAddress", ""),
-                            "PredictedAddress": r.get("PredictedAddress", ""),
-                            "CorrectAddress": r.get("CorrectAddress", ""),
-                            "Reason": expl.get("reason", ""),
-                            "RulePattern": expl.get("rule_suggestion", {}).get("pattern", ""),
-                            "RuleReplacement": expl.get("rule_suggestion", {}).get("replacement", ""),
-                            "RuleWhere": expl.get("rule_suggestion", {}).get("where", "post"),
-                            "FewShotInput": expl.get("few_shot_hint", {}).get("input", ""),
-                            "FewShotOutput": expl.get("few_shot_hint", {}).get("output", ""),
-                            "ApproveRule": False,
-                            "ApproveFewShot": True if expl.get("few_shot_hint", {}).get("output") else False,
-                        })
-                    sugdf = pd.DataFrame(sugg_rows)
-                    st.dataframe(sugdf.head(100), use_container_width=True)
+            # Canonical comparison
+            combo["_pred_norm"] = combo["PredictedAddress"].apply(canonicalize_for_compare)
+            combo["_corr_norm"] = combo["CorrectAddress"].apply(canonicalize_for_compare)
+            combo["ExactMatch"] = combo["_pred_norm"] == combo["_corr_norm"]
 
-                    # Export suggestions CSV
-                    buf = io.StringIO(); sugdf.to_csv(buf, index=False); buf.seek(0)
-                    st.download_button("⬇️ Download suggestions (CSV)", data=buf.getvalue(), file_name=SUGGESTIONS_EXPORT, mime="text/csv")
+            accuracy = (combo["ExactMatch"].sum() / max(1, len(combo))) * 100.0
+            st.success(f"✅ Accuracy: {accuracy:.2f}% (exact normalized match)")
 
-                    # Apply approved suggestions immediately
-                    if st.button("✅ Apply approved suggestions now"):
-                        store = get_store()
-                        applied_rules = 0
-                        added_few = 0
-                        for _, row in sugdf.iterrows():
-                            if row.get("ApproveRule") and row.get("RulePattern"):
-                                rule_obj = {
-                                    "pattern": str(row.get("RulePattern")),
-                                    "replacement": str(row.get("RuleReplacement", "")),
-                                    "where": str(row.get("RuleWhere", "post")).lower() if str(row.get("RuleWhere", "post")).lower() in ("pre", "post", "both") else "post",
-                                }
-                                if rule_obj not in store["custom_rules"]:
-                                    store["custom_rules"].append(rule_obj)
-                                    applied_rules += 1
-                            if row.get("ApproveFewShot") and row.get("FewShotInput") and row.get("FewShotOutput"):
-                                pair = (str(row.get("FewShotInput")), str(row.get("FewShotOutput")))
-                                if pair not in store["fewshot_examples"]:
-                                    store["fewshot_examples"].append(pair)
-                                    added_few += 1
-                            lp = {"raw": row.get("RawAddress", ""), "predicted": row.get("PredictedAddress", ""), "correct": row.get("CorrectAddress", "")}
-                            if lp not in store["learning_pairs"]:
-                                store["learning_pairs"].append(lp)
-                        st.success(f"Applied: {applied_rules} rules, added {added_few} few-shot examples. Export the learning store from the sidebar to persist.")
+            # Outputs (include clean ID when available)
+            if id_col != "<none>":
+                combo["ID"] = combo["_id_norm"]
 
-        # Downloads
-        # Non-exact matches CSV
-        if len(non_matches) > 0:
-            nm_cols = [c for c in ["ID" if "ID" in non_matches.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress"] if c in non_matches.columns]
-            nm_buf = io.StringIO(); non_matches[nm_cols].to_csv(nm_buf, index=False)
-            st.download_button("⬇️ Download Non-Exact Matches (CSV)", data=nm_buf.getvalue(), file_name="address_non_exact_matches.csv", mime="text/csv")
+            # Preview
+            st.subheader("Results Preview")
+            preview_cols = [c for c in ["ID" if "ID" in combo.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress", "ExactMatch"] if c in combo.columns]
+            st.dataframe(combo[preview_cols].head(50), use_container_width=True)
 
-        # Full evaluation CSV
-        csv_buf = io.StringIO()
-        out_cols = [c for c in ["ID" if "ID" in combo.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress", "ExactMatch"] if c in combo.columns]
-        combo[out_cols].to_csv(csv_buf, index=False)
-        st.download_button("📥 Download Evaluation Results (CSV)", data=csv_buf.getvalue(), file_name="address_evaluation_results.csv")
+            # Non-exact matches + Learning widgets
+            non_matches = combo.loc[~combo["ExactMatch"]].copy()
+            st.subheader(f"❗ Non-exact matches: {len(non_matches)}")
+            if len(non_matches) > 0:
+                nm_cols = [c for c in ["ID" if "ID" in non_matches.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress"] if c in non_matches.columns]
+                st.dataframe(non_matches[nm_cols].head(25), use_container_width=True)
+
+                # LLM-assisted mismatch explanations
+                if enable_learning:
+                    st.markdown("**Analyze mismatches and propose learning rules/examples**")
+                    sugg_rows = []
+                    max_analyze = st.slider("How many non-matches to analyze now?", 0, min(100, len(non_matches)), value=min(25, len(non_matches)))
+                    go2 = st.button("🔎 Analyze selected non-matches")
+                    if go2 and max_analyze > 0:
+                        sub_nm = non_matches.head(max_analyze)
+                        for _, r in sub_nm.iterrows():
+                            expl = explain_mismatch(
+                                str(r.get("RawAddress", "")),
+                                str(r.get("PredictedAddress", "")),
+                                str(r.get("CorrectAddress", "")),
+                                model_name
+                            )
+                            sugg_rows.append({
+                                "RawAddress": r.get("RawAddress", ""),
+                                "PredictedAddress": r.get("PredictedAddress", ""),
+                                "CorrectAddress": r.get("CorrectAddress", ""),
+                                "Reason": expl.get("reason", ""),
+                                "RulePattern": expl.get("rule_suggestion", {}).get("pattern", ""),
+                                "RuleReplacement": expl.get("rule_suggestion", {}).get("replacement", ""),
+                                "RuleWhere": expl.get("rule_suggestion", {}).get("where", "post"),
+                                "FewShotInput": expl.get("few_shot_hint", {}).get("input", ""),
+                                "FewShotOutput": expl.get("few_shot_hint", {}).get("output", ""),
+                                "ApproveRule": False,
+                                "ApproveFewShot": True if expl.get("few_shot_hint", {}).get("output") else False,
+                            })
+                        sugdf = pd.DataFrame(sugg_rows)
+                        st.dataframe(sugdf.head(100), use_container_width=True)
+
+                        # Export suggestions CSV
+                        buf = io.StringIO(); sugdf.to_csv(buf, index=False); buf.seek(0)
+                        st.download_button("⬇️ Download suggestions (CSV)", data=buf.getvalue(), file_name=SUGGESTIONS_EXPORT, mime="text/csv")
+
+                        # Apply approved suggestions immediately
+                        if st.button("✅ Apply approved suggestions now"):
+                            store = get_store()
+                            applied_rules = 0
+                            added_few = 0
+                            for _, row in sugdf.iterrows():
+                                if row.get("ApproveRule") and row.get("RulePattern"):
+                                    rule_obj = {
+                                        "pattern": str(row.get("RulePattern")),
+                                        "replacement": str(row.get("RuleReplacement", "")),
+                                        "where": str(row.get("RuleWhere", "post")).lower() if str(row.get("RuleWhere", "post")).lower() in ("pre", "post", "both") else "post",
+                                    }
+                                    if rule_obj not in store["custom_rules"]:
+                                        store["custom_rules"].append(rule_obj)
+                                        applied_rules += 1
+                                if row.get("ApproveFewShot") and row.get("FewShotInput") and row.get("FewShotOutput"):
+                                    pair = (str(row.get("FewShotInput")), str(row.get("FewShotOutput")))
+                                    if pair not in store["fewshot_examples"]:
+                                        store["fewshot_examples"].append(pair)
+                                        added_few += 1
+                                lp = {"raw": row.get("RawAddress", ""), "predicted": row.get("PredictedAddress", ""), "correct": row.get("CorrectAddress", "")}
+                                if lp not in store["learning_pairs"]:
+                                    store["learning_pairs"].append(lp)
+                            st.success(f"Applied: {applied_rules} rules, added {added_few} few-shot examples. Export the learning store from the sidebar to persist.")
+
+                # Download non-exact matches CSV
+                nm_buf = io.StringIO(); non_matches[nm_cols].to_csv(nm_buf, index=False)
+                st.download_button("⬇️ Download Non-Exact Matches (CSV)", data=nm_buf.getvalue(), file_name="address_non_exact_matches.csv", mime="text/csv")
+
+            # Full evaluation CSV
+            csv_buf = io.StringIO()
+            out_cols = [c for c in ["ID" if "ID" in combo.columns else None, "RawAddress", "PredictedAddress", "CorrectAddress", "ExactMatch"] if c in combo.columns]
+            combo[out_cols].to_csv(csv_buf, index=False)
+            st.download_button("📥 Download Evaluation Results (CSV)", data=csv_buf.getvalue(), file_name="address_evaluation_results.csv")
 
 # =========================
 # PRODUCTION MODE
@@ -866,19 +901,24 @@ if mode.startswith("Evaluation"):
 else:
     st.header("🚀 Production: Generate Corrected Addresses CSV")
     raw_file_p = st.file_uploader("Upload RAW addresses (CSV)", type=["csv"], key="raw_prod")
-
-    submitted_prod = st.button("▶️ Submit & Process Addresses", disabled=not raw_file_p)
-
-    if raw_file_p and submitted_prod:
+    if raw_file_p:
         raw_df = pd.read_csv(raw_file_p)
+        raw_df = raw_df.head(int(DEFAULT_MAX_ROWS if max_rows is None else max_rows)).copy()
         raw_cols = list(raw_df.columns)
 
-        st.subheader("Select Columns")
-        raw_line1_col = st.selectbox("Raw: Address Line 1 column", options=raw_cols, index=min(0, len(raw_cols)-1), key="rp_l1")
-        raw_line2_col = st.selectbox("Raw: Address Line 2 column (optional)", options=["<none>"] + raw_cols, index=0, key="rp_l2")
-        id_col = st.selectbox("Optional: ID column (e.g., CWID)", options=["<none>"] + raw_cols, index=0, key="rp_id")
+        # Autodetect
+        auto_raw_line1 = _pick(raw_cols, ["AddrLine1", "Address1", "Address", "Street", "Line1"]) or raw_cols[0]
+        auto_raw_line2 = _pick(raw_cols, ["AddrLine2", "Address2", "Line2"], default="<none>")
+        auto_id = "CWID" if ("CWID" in raw_cols) else "<none>"
 
-        raw_df = raw_df.head(int(DEFAULT_MAX_ROWS if max_rows is None else max_rows)).copy()
+        with st.expander("Edit column selections", expanded=False):
+            raw_line1_col = st.selectbox("Raw: Address Line 1 column", options=raw_cols, index=raw_cols.index(auto_raw_line1))
+            raw_line2_col = st.selectbox("Raw: Address Line 2 column (optional)", options=["<none>"] + raw_cols, index=( ["<none>"] + raw_cols ).index(auto_raw_line2 if auto_raw_line2 in raw_cols else "<none>"))
+            id_col = st.selectbox("Optional: ID column (e.g., CWID)", options=["<none>"] + raw_cols, index=( ["<none>"] + raw_cols ).index(auto_id))
+        if 'raw_line1_col' not in locals():
+            raw_line1_col = auto_raw_line1
+            raw_line2_col = auto_raw_line2
+            id_col = auto_id
 
         # Build RawAddress
         if raw_line2_col != "<none>" and raw_line2_col in raw_df.columns:
@@ -900,48 +940,51 @@ else:
                 .str.replace(r"\.0$", "", regex=True)
             )
 
-        st.subheader("Processing (Rules → LLM)")
-        progress = st.progress(0.0)
-        results = []
-        total = len(raw_df)
+        st.subheader("Processing")
+        go = st.button("Submit", type="primary")
+        if go:
+            placeholder = st.empty()
+            progress = st.progress(0)
+            results = []
+            total = len(raw_df)
+            for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
+                interim = rule_clean(
+                    raw,
+                    compounds,
+                    unit_style=unit_style,
+                    infer_unlabeled_unit=infer_unlabeled_unit,
+                    preserve_proper_directionals=preserve_proper_directionals,
+                )
+                pred = llm_correct(
+                    interim,
+                    compounds,
+                    model_name,
+                    unit_style=unit_style,
+                    infer_unlabeled_unit=infer_unlabeled_unit,
+                    preserve_proper_directionals=preserve_proper_directionals,
+                )
+                pred = re.sub(r"\s+", " ", pred).strip()
+                results.append(pred)
+                progress.progress(i / max(1, total))
+                placeholder.text(f"Processed {i}/{total}")
 
-        for i, raw in enumerate(raw_df["RawAddress"].astype(str).tolist(), start=1):
-            interim = rule_clean(
-                raw,
-                compounds,
-                unit_style=unit_style,
-                infer_unlabeled_unit=infer_unlabeled_unit,
-                preserve_proper_directionals=preserve_proper_directionals,
+            # Build output CSV (ID + CorrectedAddress, plus Raw for audit)
+            out_df = pd.DataFrame({"CorrectedAddress": results})
+            if id_col != "<none>":
+                out_df = pd.concat([raw_df[["ID"]].reset_index(drop=True), out_df], axis=1)
+            out_df = pd.concat([out_df, raw_df[["RawAddress"]].reset_index(drop=True)], axis=1)
+
+            st.subheader("Preview (first 50)")
+            st.dataframe(out_df.head(50), use_container_width=True)
+
+            csv_buf = io.StringIO()
+            out_df.to_csv(csv_buf, index=False)
+            st.download_button(
+                "⬇️ Download Corrected Addresses (CSV)",
+                data=csv_buf.getvalue(),
+                file_name="corrected_addresses.csv",
+                mime="text/csv",
             )
-            pred = llm_correct(
-                interim,
-                compounds,
-                model_name,
-                unit_style=unit_style,
-                infer_unlabeled_unit=infer_unlabeled_unit,
-                preserve_proper_directionals=preserve_proper_directionals,
-            )
-            pred = re.sub(r"\s+", " ", pred).strip()
-            results.append(pred)
-            progress.progress(min(i / max(1, total), 1.0))
-
-        # Build output CSV (ID + CorrectedAddress, plus Raw for audit)
-        out_df = pd.DataFrame({"CorrectedAddress": results})
-        if id_col != "<none>":
-            out_df = pd.concat([raw_df[["ID"]].reset_index(drop=True), out_df], axis=1)
-        out_df = pd.concat([out_df, raw_df[["RawAddress"]].reset_index(drop=True)], axis=1)
-
-        st.subheader("Preview (first 50)")
-        st.dataframe(out_df.head(50), use_container_width=True)
-
-        csv_buf = io.StringIO()
-        out_df.to_csv(csv_buf, index=False)
-        st.download_button(
-            "⬇️ Download Corrected Addresses (CSV)",
-            data=csv_buf.getvalue(),
-            file_name="corrected_addresses.csv",
-            mime="text/csv",
-        )
 
     st.caption(
         "In Production mode, the app outputs the corrected address line per record using the Rules → LLM → Adaptive layer. "
